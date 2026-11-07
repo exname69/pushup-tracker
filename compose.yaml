@@ -1,0 +1,13 @@
+services:
+  bot:
+    build: .
+    restart: unless-stopped
+    env_file:
+      - .env
+    volumes:
+      - pushup-data:/data
+    environment:
+      DB_PATH: /data/pushups.sqlite3
+
+volumes:
+  pushup-data:

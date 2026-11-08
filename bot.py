@@ -6,6 +6,7 @@ import logging
 import os
 import re
 import tempfile
+import time
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -474,44 +475,136 @@ async def main() -> None:
             # Ни запись в SQLite, ни запрос ручного ввода в debug-режиме не создаются.
             if message.chat.type == "private":
                 note = message.video_note
-                size_mb = (note.file_size or 0) / (1024 * 1024)
                 details = [
-                    "🔎 <b>Отладка видеокружочка</b>",
-                    f"⏱ Длительность: {note.duration} с",
-                    f"📐 Размер кадра: {note.length}×{note.length}",
-                    f"💾 Размер файла: {size_mb:.2f} МБ" if note.file_size is not None else "💾 Размер файла: неизвестен",
+                    "🔎 <b>Gemini: диагностика видео</b>",
+                    f"🎬 Длительность видео: {note.duration} с",
+                    (
+                        f"💾 Размер: {note.file_size / (1024 * 1024):.2f} МБ"
+                        if note.file_size is not None else "💾 Размер: неизвестен"
+                    ),
+                    f"📦 Локальный лимит файла: {MAX_DOWNLOAD_BYTES / (1024 * 1024):.0f} МБ",
+                    "🌐 Таймаут скачивания: 90 с",
+                    "🧵 Одновременно анализируется до 2 видео",
                 ]
                 if note.file_size and note.file_size > MAX_DOWNLOAD_BYTES:
-                    details.append("❌ Файл превышает лимит 20 МБ — анализ не выполнялся.")
+                    details.append("❌ Файл превышает локальный лимит — анализ не выполнялся.")
                     details.append("🧪 Результат не записан в статистику.")
                     await message.answer("\n".join(details), parse_mode="HTML")
                     return
 
+                def field(obj, key, default=None):
+                    """Работает с dict, dataclass и объектами SDK Gemini."""
+                    if obj is None:
+                        return default
+                    if isinstance(obj, dict):
+                        return obj.get(key, default)
+                    return getattr(obj, key, default)
+
+                started = time.perf_counter()
+                queue_seconds = None
+                download_seconds = None
+                analysis_seconds = None
+                phase = "ожидание свободного слота"
+                analysis = None
+                error = None
                 try:
-                    # Тот же анализатор, что и в группе, с общим ограничением параллелизма.
+                    # Общий semaphore такой же, как в группах.
                     async with semaphore:
+                        queue_seconds = time.perf_counter() - started
                         with tempfile.TemporaryDirectory(prefix="pushup-debug-") as tempdir:
                             target = Path(tempdir) / "note.mp4"
-                            await bot.download(note.file_id, destination=target, timeout=90)
-                            analysis = await asyncio.to_thread(analyze_video, target)
-                except Exception:
-                    log.exception("Ошибка debug-анализа кружочка user=%s", message.from_user.id if message.from_user else "unknown")
-                    details.append("❌ Ошибка скачивания или анализа видео. Подробности — в логах бота.")
+                            phase = "скачивание из Telegram"
+                            download_started = time.perf_counter()
+                            try:
+                                await bot.download(note.file_id, destination=target, timeout=90)
+                            finally:
+                                download_seconds = time.perf_counter() - download_started
+
+                            phase = "анализ Gemini"
+                            analysis_started = time.perf_counter()
+                            try:
+                                analysis = await asyncio.to_thread(analyze_video, target)
+                            finally:
+                                analysis_seconds = time.perf_counter() - analysis_started
+                except Exception as exc:
+                    error = exc
+                    log.exception(
+                        "Ошибка debug-анализа кружочка user=%s phase=%s",
+                        message.from_user.id if message.from_user else "unknown",
+                        phase,
+                    )
+
+                details.append("\n⏱ <b>Замеры времени</b>")
+                if queue_seconds is not None:
+                    details.append(f"⏳ Ожидание слота: {queue_seconds:.2f} с")
+                if download_seconds is not None:
+                    details.append(f"📥 Скачивание: {download_seconds:.2f} с")
+                if analysis_seconds is not None:
+                    details.append(f"🤖 Анализ Gemini: {analysis_seconds:.2f} с")
+                details.append(f"🕒 Всего: {time.perf_counter() - started:.2f} с")
+
+                if error is not None:
+                    details.append(
+                        f"❌ Ошибка на этапе «{phase}» ({type(error).__name__}). "
+                        "Подробности — в логах."
+                    )
+                elif analysis is None:
+                    details.append("⚠️ Анализатор не вернул надёжный результат.")
                 else:
-                    if analysis is None:
-                        details.append("⚠️ Не удалось уверенно распознать отжимания.")
-                        details.append("💡 Попробуй снять себя сбоку, чтобы были видны руки и корпус.")
-                    else:
-                        confidence = analysis.valid_frames / analysis.sampled_frames * 100 if analysis.sampled_frames else 0
-                        details.extend([
-                            f"💪 Отжиманий: <b>{analysis.repetitions}</b>",
-                            f"🎞 Обработано кадров: {analysis.sampled_frames}",
-                            f"✅ Кадров с подходящей позой: {analysis.valid_frames}",
-                            f"📊 Доля распознанных кадров: {confidence:.1f}%",
-                            "✅ Анализ завершён.",
-                        ])
-                        if analysis.repetitions == 0:
-                            details.append("ℹ️ Поза обнаружена, но полных циклов отжиманий не найдено.")
+                    count = field(analysis, "repetitions", field(analysis, "count"))
+                    uncertain = field(analysis, "uncertain")
+                    timestamps = field(analysis, "completed_at_seconds")
+                    details.append("\n💪 <b>Результат</b>")
+                    details.append(f"Отжиманий: <b>{count}</b>" if count is not None else "Отжиманий: нет данных")
+                    if uncertain is not None:
+                        details.append(f"Неопределённость: {'⚠️ да' if uncertain else '✅ нет'}")
+                    if timestamps is not None:
+                        details.append(
+                            "Моменты завершения: "
+                            + (", ".join(f"{float(t):g} с" for t in timestamps) if timestamps else "нет")
+                        )
+                    details.append("✅ Ответ анализатора получен.")
+
+                    # Токены доступны только если vision.py возвращает usage_metadata
+                    # либо исходный объект response. Сам анализатор пока может их не пробрасывать.
+                    response = field(analysis, "response", field(analysis, "raw_response"))
+                    usage = field(analysis, "usage_metadata", field(analysis, "usage"))
+                    if usage is None:
+                        usage = field(response, "usage_metadata")
+
+                    details.append("\n🔢 <b>Использование токенов</b>")
+                    token_fields = (
+                        ("Вход", "prompt_token_count", "prompt_tokens"),
+                        ("Выход", "candidates_token_count", "output_tokens"),
+                        ("Thinking", "thoughts_token_count", "thinking_tokens"),
+                        ("Из кеша", "cached_content_token_count", "cached_tokens"),
+                        ("Всего", "total_token_count", "total_tokens"),
+                    )
+                    token_found = False
+                    for label, sdk_key, alternative in token_fields:
+                        value = field(usage, sdk_key)
+                        if value is None:
+                            value = field(analysis, alternative)
+                        if value is not None:
+                            details.append(f"{label}: {value}")
+                            token_found = True
+                    if not token_found:
+                        details.append("Недоступны: vision.py не передал usage_metadata.")
+
+                    model = field(analysis, "model", field(response, "model_version"))
+                    if model:
+                        details.append(f"🧠 Модель: {html.escape(str(model))}")
+                    finish_reason = field(analysis, "finish_reason")
+                    if finish_reason is None:
+                        candidates = field(response, "candidates")
+                        if candidates:
+                            finish_reason = field(candidates[0], "finish_reason")
+                    if finish_reason is not None:
+                        details.append(f"🛑 Причина завершения: {html.escape(str(finish_reason))}")
+                    output_limit = field(analysis, "max_output_tokens")
+                    if output_limit is not None:
+                        details.append(f"🔒 Настроенный лимит output tokens: {output_limit}")
+
                 details.append("🧪 Тестовый режим: результат не записан в статистику.")
                 await message.answer("\n".join(details), parse_mode="HTML")
                 return

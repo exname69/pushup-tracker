@@ -44,20 +44,31 @@ def analyze_video(path: str | Path, target_fps: int = 5) -> Analysis | None:
         return None
 
     fps = max(2, min(int(target_fps), 8))
-    model = os.getenv("GEMINI_MODEL", "gemini-2.5-flash-lite")
+    model = os.getenv("GEMINI_MODEL", "gemini-3.5-flash-lite")
+
     prompt = (
-        "Ты анализируешь ОДНО короткое видео с отжиманиями. "
-        "Посчитай только реально видимые законченные циклы опускания и подъёма корпуса. "
-        "Техника может быть плохой, ноги могут быть вне кадра, ракурс может быть фронтальным. "
-        "Не требуй идеальной техники, но не считай разговор, движения головой, дрожание камеры, "
-        "неполные движения и невидимые повторы. "
-        "Определи моменты каждого завершённого подъёма. "
-        "Если циклы неотличимы или качество недостаточно, укажи uncertain=true. "
-        "Не оценивай результат по предполагаемому темпу; считай по наблюдаемым циклам. "
-        "Верни строго JSON-объект вида: "
+        "Analyze the provided video and accurately count the number of completed push-ups. "
+        "A push-up counts as completed only when the person lowers their body and then pushes "
+        "back up to the starting position. Count each full repetition exactly once. "
+        "Technique may be imperfect, legs may be outside the frame, and the camera angle "
+        "may be frontal. Do not require perfect form, but ignore incomplete repetitions, "
+        "head movements, talking, camera shaking, and repetitions that are not visible. "
+        "Record the timestamp (in seconds from the beginning of the video) when each "
+        "repetition is completed. "
+        "Count only observable movement cycles. Never estimate repetitions based on "
+        "assumed exercise pace. "
+        "Return strictly a valid JSON object with this exact structure: "
         '{"count": 3, "completed_at_seconds": [2.4, 4.1, 6.3], "uncertain": false}. '
-        "count должен в точности совпадать с длиной completed_at_seconds. "
-        "Если отжиманий точно нет, верни count=0 и пустой список."
+        "Requirements: "
+        "count must exactly match the length of completed_at_seconds. "
+        "Timestamps must be numeric, in seconds, and sorted chronologically. "
+        'If there are definitely no completed push-ups, return '
+        '{"count": 0, "completed_at_seconds": [], "uncertain": false}. '
+        "Set uncertain to true if the video quality, visibility, or ambiguous movement "
+        "cycles prevent a reliable count. "
+        "Do not invent repetitions or timestamps. "
+        "Output only the raw JSON object. No Markdown, code fences, explanations, "
+        "or additional text."
     )
 
     try:

@@ -215,6 +215,7 @@ async def main() -> None:
     tz = ZoneInfo(os.getenv("REPORT_TIMEZONE", "Europe/Zurich"))
     try:
         daily_target = int(os.getenv("DAILY_TARGET", "100"))
+        cash_fine = int(os.getenv("CASH_FINE", "500"))
     except ValueError as exc:
         raise ValueError("DAILY_TARGET должен быть целым положительным числом") from exc
     if daily_target <= 0:

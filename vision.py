@@ -63,19 +63,7 @@ def analyze_video(
 
 
     prompt = (
-        "Count ALL visible push-up-like movements in the video. "
-        "Count every distinct down-up body movement as one repetition, "
-        "including partial, shallow, fast, sloppy push-ups and rhythmic body rocking. "
-        "Accept ANY camera angle, especially frontal views. "
-        "Do NOT require proper technique, full arm extension, visible legs, "
-        "or the entire body to be in frame. "
-        "Track torso, shoulder, and arm movements. "
-        "Do NOT skip small, fast, or nearly identical repetitions. "
-        "Count every observable cycle exactly once, even with minimal movement. "
-        "Ignore unrelated movements and camera shake. "
-        "Never invent invisible repetitions or estimate by rhythm alone. "
-        "Record the completion time of each repetition in seconds. "
-        "Set uncertain=true only if individual movements cannot be distinguished. "
+        "Посчитай отжимания просто даже самые грязные и неправильные даже если в кадре нет ничего кроме головы которая болтается считай ее"
         "Return ONLY valid JSON: "
         '{"count": 3, "completed_at_seconds": [2.4, 4.1, 6.3], "uncertain": false}. '
         "count MUST equal the number of timestamps, sorted chronologically. "

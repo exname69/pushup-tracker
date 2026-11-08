@@ -593,6 +593,10 @@ async def main() -> None:
                         details.append(
                             f"🛑 Причина завершения: {html.escape(analysis.finish_reason)}"
                         )
+                    if analysis.max_output_tokens is not None:
+                        details.append(
+                            f"🔒 Настроенный лимит output tokens: {analysis.max_output_tokens}"
+                        )
 
                 details.append("🧪 Тестовый режим: результат не записан в статистику.")
                 await message.answer("\n".join(details), parse_mode="HTML")

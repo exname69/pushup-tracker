@@ -24,7 +24,7 @@ MAX_MANUAL_COUNT = 1000
 
 
 def setup_manual_storage(db: Storage) -> None:
-    """Migrate the original SQLite schema without changing storage.py."""
+    """Дополнить исходную схему SQLite, не изменяя storage.py."""
     columns = {row[1] for row in db.conn.execute("PRAGMA table_info(video_counts)")}
     with db.conn:
         if "is_manual" not in columns:
@@ -49,11 +49,9 @@ def setup_manual_storage(db: Storage) -> None:
 def daily_report_rows(
     db: Storage, chat_id: int, day: date, tz: ZoneInfo, daily_target: int = 100
 ) -> list[tuple[str, int, int, int, int]]:
-    """Return (name, reps, videos, manual_videos, goal) for each known member.
+    """Вернуть для каждого участника (имя, повторы, видео, ручные видео, цель).
 
-    Any missed *effective* daily goal makes the next day's goal 3x the base.
-    The multiplier does not compound: 100 -> 300 -> 300 until the goal is met.
-    No missed days are assigned before a member's first recorded video.
+    Если дневная норма не выполнена, на следующий день действует штрафная норма.
     """
     end_utc = datetime.combine(
         day + timedelta(days=1), datetime.min.time(), tzinfo=tz
@@ -130,12 +128,15 @@ async def main() -> None:
     semaphore = asyncio.Semaphore(2)
     report_lock = asyncio.Lock()
 
+    # Текст правил хранится отдельно и перечитывается при каждом вызове команды.
+    rules_path = Path(os.getenv("RULES_PATH", str(Path(__file__).with_name("rules.txt"))))
+
     def get_report(chat_id: int, day: date) -> str:
         return report_text(day, daily_report_rows(db, chat_id, day, tz, daily_target), daily_target)
 
     async with Bot(token=token) as bot:
         async def ask_manual(message: Message, reason: str) -> None:
-            """Persist the request before sending a ForceReply prompt."""
+            """Сохранить запрос до отправки сообщения с просьбой о ручном вводе."""
             if not message.from_user or not message.video_note:
                 return
             chat_id, message_id = message.chat.id, message.message_id
@@ -205,9 +206,26 @@ async def main() -> None:
                 "🏋️ Пришлите видеокружочек с отжиманиями. Я посчитаю повторы и отмечу выполнение дневной нормы.\n"
                 "Если видео не распознаётся, попрошу автора написать число вручную. "
                 "Такие результаты помечаются ✍️ и их можно проверить.\n"
-                "Команды: /stats — сегодня, /yesterday — вчера. "
+                "Команды: /stats — сегодня, /yesterday — вчера, /rules — правила. "
                 f"Дневная норма: {daily_target}. Отчёт — в 00:00 ({tz.key})."
             )
+
+        @dp.message(Command("rules", "pravila"))
+        async def on_rules(message: Message) -> None:
+            """Показать правила челленджа из отдельного текстового файла."""
+            try:
+                rules = rules_path.read_text(encoding="utf-8").strip()
+            except OSError:
+                log.exception("Не удалось прочитать файл правил: %s", rules_path)
+                await message.answer("⚠️ Файл правил недоступен.")
+                return
+            if not rules:
+                await message.answer("⚠️ Правила пока не заполнены.")
+                return
+            # Без parse_mode: текст файла выводится как есть, без проблем с HTML.
+            # Telegram ограничивает размер сообщения 4096 символами.
+            for start in range(0, len(rules), 4000):
+                await message.answer(rules[start:start + 4000], parse_mode=None)
 
         @dp.message(Command("stats", "yesterday"))
         async def on_stats(message: Message) -> None:
@@ -240,7 +258,7 @@ async def main() -> None:
                 await message.reply(f"Напиши только число от 0 до {MAX_MANUAL_COUNT} в ответ на запрос бота.")
                 return
             count = int(value)
-            # No await between saving and deleting the pending row: avoid duplicate counts.
+            # Между сохранением результата и удалением ожидающего запроса нет await, чтобы избежать дублей.
             inserted = db.save_video(
                 message.chat.id, original_id, user_id, name,
                 count, datetime.fromisoformat(sent_at_utc),
@@ -267,8 +285,53 @@ async def main() -> None:
 
         @dp.message(F.video_note)
         async def on_video_note(message: Message) -> None:
+            # В личном чате анализируем кружочек отдельно от статистики группы.
+            # Ни запись в SQLite, ни запрос ручного ввода в debug-режиме не создаются.
+            if message.chat.type == "private":
+                note = message.video_note
+                size_mb = (note.file_size or 0) / (1024 * 1024)
+                details = [
+                    "🔎 <b>Отладка видеокружочка</b>",
+                    f"⏱ Длительность: {note.duration} с",
+                    f"📐 Размер кадра: {note.length}×{note.length}",
+                    f"💾 Размер файла: {size_mb:.2f} МБ" if note.file_size is not None else "💾 Размер файла: неизвестен",
+                ]
+                if note.file_size and note.file_size > MAX_DOWNLOAD_BYTES:
+                    details.append("❌ Файл превышает лимит 20 МБ — анализ не выполнялся.")
+                    details.append("🧪 Результат не записан в статистику.")
+                    await message.answer("\n".join(details), parse_mode="HTML")
+                    return
+
+                try:
+                    # Тот же анализатор, что и в группе, с общим ограничением параллелизма.
+                    async with semaphore:
+                        with tempfile.TemporaryDirectory(prefix="pushup-debug-") as tempdir:
+                            target = Path(tempdir) / "note.mp4"
+                            await bot.download(note.file_id, destination=target, timeout=90)
+                            analysis = await asyncio.to_thread(analyze_video, target)
+                except Exception:
+                    log.exception("Ошибка debug-анализа кружочка user=%s", message.from_user.id if message.from_user else "unknown")
+                    details.append("❌ Ошибка скачивания или анализа видео. Подробности — в логах бота.")
+                else:
+                    if analysis is None:
+                        details.append("⚠️ Не удалось уверенно распознать отжимания.")
+                        details.append("💡 Попробуй снять себя сбоку, чтобы были видны руки и корпус.")
+                    else:
+                        confidence = analysis.valid_frames / analysis.sampled_frames * 100 if analysis.sampled_frames else 0
+                        details.extend([
+                            f"💪 Отжиманий: <b>{analysis.repetitions}</b>",
+                            f"🎞 Обработано кадров: {analysis.sampled_frames}",
+                            f"✅ Кадров с подходящей позой: {analysis.valid_frames}",
+                            f"📊 Доля распознанных кадров: {confidence:.1f}%",
+                            "✅ Анализ завершён.",
+                        ])
+                        if analysis.repetitions == 0:
+                            details.append("ℹ️ Поза обнаружена, но полных циклов отжиманий не найдено.")
+                details.append("🧪 Тестовый режим: результат не записан в статистику.")
+                await message.answer("\n".join(details), parse_mode="HTML")
+                return
+
             if message.chat.type not in ("group", "supergroup"):
-                await message.answer("Добавьте меня в группу: там я считаю отжимания и публикую выполнение дневной нормы.")
                 return
             if not message.from_user or message.from_user.is_bot:
                 return

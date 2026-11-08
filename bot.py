@@ -23,6 +23,8 @@ from vision import analyze_video
 log = logging.getLogger(__name__)
 MAX_DOWNLOAD_BYTES = 20 * 1024 * 1024
 MAX_MANUAL_COUNT = 1000
+MAX_DAILY_OVERRIDE = 100_000
+DEBUG_GEMINI_MODEL = "gemini-3.5-flash-lite"
 
 
 def setup_manual_storage(db: Storage) -> None:
@@ -146,10 +148,11 @@ class AccessMiddleware(BaseMiddleware):
 
 def daily_report_rows(
     db: Storage, chat_id: int, day: date, tz: ZoneInfo, daily_target: int = 100
-) -> list[tuple[str, int, int, int, int]]:
-    """Вернуть для каждого участника (имя, повторы, видео, ручные видео, цель).
+) -> list[tuple[str, int, int, int, int, bool]]:
+    """(имя, повторы, видео, ручные видео, цель, override).
 
-    Если дневная норма не выполнена, на следующий день действует штрафная норма.
+    Админская корректировка переопределяет итог дня, но не число кружочков.
+    Штрафные цели пересчитываются с учётом корректировок прошлых дней.
     """
     end_utc = datetime.combine(
         day + timedelta(days=1), datetime.min.time(), tzinfo=tz
@@ -169,10 +172,23 @@ def daily_report_rows(
     for user_id, name, count, manual, timestamp in video_rows:
         video_day = datetime.fromisoformat(timestamp).astimezone(tz).date()
         member = members.setdefault(user_id, {"name": name, "first": video_day, "days": {}})
-        totals = member["days"].setdefault(video_day, [0, 0, 0])
+        member["first"] = min(member["first"], video_day)
+        totals = member["days"].setdefault(video_day, [0, 0, 0, False])
         totals[0] += count
         totals[1] += 1
         totals[2] += manual
+
+    # Переопределение применяется ПОСЛЕ суммирования видео.
+    # Оно меняет дневной результат, а не количество записанных видео.
+    for user_id, name, override_day, override_count in db.daily_overrides_until(chat_id, day):
+        member = members.setdefault(
+            user_id, {"name": name, "first": override_day, "days": {}}
+        )
+        member["name"] = name
+        member["first"] = min(member["first"], override_day)
+        totals = member["days"].setdefault(override_day, [0, 0, 0, False])
+        totals[0] = override_count
+        totals[3] = True
 
     result = []
     for member in sorted(members.values(), key=lambda m: m["name"].casefold()):
@@ -182,29 +198,35 @@ def daily_report_rows(
             done = member["days"].get(current_day, [0])[0]
             goal = daily_target if done >= goal else daily_target * 2 + 10
             current_day += timedelta(days=1)
-        reps, videos, manual = member["days"].get(day, [0, 0, 0])
-        result.append((member["name"], reps, videos, manual, goal))
+        reps, videos, manual, overridden = member["days"].get(day, [0, 0, 0, False])
+        result.append((member["name"], reps, videos, manual, goal, overridden))
     return result
 
 
-def report_text(day: date, rows: list[tuple[str, int, int, int, int]], target: int = 100) -> str:
+def report_text(
+    day: date, rows: list[tuple[str, int, int, int, int, bool]], target: int = 100
+) -> str:
     lines = [
         f"🏋️ <b>Отжимания за {day:%d.%m.%Y}</b>",
         f"🎯 Обычная норма: <b>{target}</b> отжиманий",
         "",
     ]
-    for name, count, videos, manual, goal in rows:
+    for name, count, videos, manual, goal, overridden in rows:
         status = "✅" if count >= goal else "❌"
         suffix = f" · ✍️ {manual} вручную" if manual else ""
+        if overridden:
+            suffix += " · 🛠️ скорректировано"
         lines.append(f"{status} <b>{html.escape(name)}</b> — {count}/{goal} · 🎥 {videos}{suffix}")
         if goal > target:
             lines.append(f"   🔥 <b>СЕГОДНЯ ШТРАФНАЯ НОРМА: {goal}!</b>")
         if count < goal:
             lines.append(f"   🚨 <b>НА {day + timedelta(days=1):%d.%m} НАЗНАЧЕНА НОРМА ×2 + 10: {target * 3}!</b>")
     if not rows:
-        lines.append("Пока нет зарегистрированных участников с кружочками.")
-    if any(manual for _, _, _, manual, _ in rows):
+        lines.append("Пока нет зарегистрированных участников с кружочками или корректировками.")
+    if any(manual for _, _, _, manual, _, _ in rows):
         lines += ["", "✍️ Результаты введены вручную — их можно перепроверить по видео."]
+    if any(overridden for _, _, _, _, _, overridden in rows):
+        lines += ["", "🛠️ Итог за день задан администратором (вместо суммы по видео)."]
     return "\n".join(lines)
 
 
@@ -381,6 +403,8 @@ async def main() -> None:
                 "Такие результаты помечаются ✍️ и их можно проверить.\n"
                 "Команды: /stats — сегодня, /yesterday — вчера, /rules — правила. "
                 f"Дневная норма: {daily_target}. Отчёт — в 00:00 ({tz.key})."
+                + ("\nВладелец: /setpushups, /clearpushups — ручная корректировка итогов за день."
+                   if message.from_user and message.from_user.id == owner_id else "")
             )
 
         @dp.message(Command("rules", "pravila"))
@@ -419,6 +443,137 @@ async def main() -> None:
             if message.text and message.text.split()[0].split("@")[0] == "/yesterday":
                 day -= timedelta(days=1)
             await message.answer(get_report(message.chat.id, day), parse_mode="HTML")
+
+        @dp.message(Command("setpushups", "clearpushups"))
+        async def on_override_pushups(message: Message) -> None:
+            """Владелец задаёт/снимает итог дня для одного участника.
+
+            Ответ на сообщение участника в группе:
+                /setpushups COUNT [YYYY-MM-DD]
+                /clearpushups [YYYY-MM-DD]
+            В группе по ID:
+                /setpushups USER_ID COUNT [YYYY-MM-DD]
+                /clearpushups USER_ID [YYYY-MM-DD]
+            В личке владельца:
+                /setpushups CHAT_ID USER_ID COUNT [YYYY-MM-DD]
+                /clearpushups CHAT_ID USER_ID [YYYY-MM-DD]
+            """
+            if not message.from_user or message.from_user.id != owner_id:
+                await message.reply("🔒 Команда доступна только владельцу бота.")
+                return
+            if message.chat.type not in ("private", "group", "supergroup"):
+                return
+            command, *args = (message.text or "").split()
+            command = command.split("@")[0].lstrip("/")
+            setting = command == "setpushups"
+            chosen_day = datetime.now(tz).date()
+            if args and re.fullmatch(r"\d{4}-\d{2}-\d{2}", args[-1]):
+                try:
+                    chosen_day = date.fromisoformat(args.pop())
+                except ValueError:
+                    await message.reply("❌ Неверная дата, нужен формат YYYY-MM-DD.")
+                    return
+
+            is_private = message.chat.type == "private"
+            reply_user = (
+                message.reply_to_message.from_user
+                if not is_private and message.reply_to_message else None
+            )
+            if reply_user and getattr(reply_user, "is_bot", False):
+                await message.reply("❌ Ответь на сообщение участника, а не бота.")
+                return
+            try:
+                if is_private:
+                    expected = 3 if setting else 2
+                    if len(args) != expected:
+                        raise ValueError("Неверное число аргументов")
+                    chat_id, user_id = int(args[0]), int(args[1])
+                    raw_count = args[2] if setting else None
+                elif reply_user:
+                    expected = 1 if setting else 0
+                    if len(args) != expected:
+                        raise ValueError("Неверное число аргументов")
+                    chat_id, user_id = message.chat.id, reply_user.id
+                    raw_count = args[0] if setting else None
+                else:
+                    expected = 2 if setting else 1
+                    if len(args) != expected:
+                        raise ValueError("Неверное число аргументов")
+                    chat_id, user_id = message.chat.id, int(args[0])
+                    raw_count = args[1] if setting else None
+
+                if chat_id >= 0 or user_id <= 0:
+                    raise ValueError("ID группы должен быть отрицательным, ID участника — положительным")
+                count = None
+                if setting:
+                    if raw_count is None or not re.fullmatch(r"[0-9]+", raw_count):
+                        raise ValueError("Количество должно быть целым неотрицательным числом")
+                    count = int(raw_count)
+                    if count > MAX_DAILY_OVERRIDE:
+                        raise ValueError(f"Максимум — {MAX_DAILY_OVERRIDE}")
+            except ValueError as exc:
+                await message.reply(
+                    f"❌ {html.escape(str(exc))}\n\n"
+                    "<b>В ответ на сообщение в группе:</b>\n"
+                    "<code>/setpushups 120 [YYYY-MM-DD]</code>\n"
+                    "<code>/clearpushups [YYYY-MM-DD]</code>\n\n"
+                    "<b>В группе по ID:</b>\n"
+                    "<code>/setpushups USER_ID 120 [YYYY-MM-DD]</code>\n"
+                    "<code>/clearpushups USER_ID [YYYY-MM-DD]</code>\n\n"
+                    "<b>В личке:</b>\n"
+                    "<code>/setpushups CHAT_ID USER_ID 120 [YYYY-MM-DD]</code>\n"
+                    "<code>/clearpushups CHAT_ID USER_ID [YYYY-MM-DD]</code>",
+                    parse_mode="HTML",
+                )
+                return
+
+            if not is_private:
+                db.register_chat(chat_id, message.chat.title or "Группа")
+            elif chat_id not in db.chat_ids():
+                await message.reply("❌ Группа не зарегистрирована в базе бота.")
+                return
+
+            display_name = reply_user.full_name if reply_user else db.member_name(chat_id, user_id)
+            if display_name is None:
+                # Не записываем произвольные ID, которых нет среди участников.
+                try:
+                    member = await bot.get_chat_member(chat_id, user_id)
+                    if getattr(member.status, "value", member.status) in ("left", "kicked"):
+                        raise ValueError("Пользователь не состоит в группе")
+                    display_name = member.user.full_name
+                except Exception:
+                    await message.reply(
+                        "❌ Не могу определить пользователя по ID. "
+                        "Ответь командой на его сообщение в группе или укажи известный ID участника."
+                    )
+                    return
+
+            if setting:
+                db.set_daily_override(
+                    chat_id, user_id, display_name, chosen_day, count, message.from_user.id
+                )
+                action_text = f"🛠️ Установлено <b>{count}</b> отжиманий"
+            else:
+                deleted = db.clear_daily_override(chat_id, user_id, chosen_day)
+                if not deleted:
+                    await message.reply("ℹ️ На указанную дату корректировка отсутствует.")
+                    return
+                action_text = "✅ Корректировка удалена, снова учитываются видео"
+
+            current = db.daily_user_total(chat_id, user_id, chosen_day, tz)
+            detail = f"\n📊 Сейчас за день: <b>{current}</b>" if current is not None else ""
+            log.info(
+                "Дневная корректировка: command=%s chat=%s user=%s day=%s count=%s admin=%s",
+                command, chat_id, user_id, chosen_day, count, message.from_user.id,
+            )
+            await message.reply(
+                f"{action_text}\n"
+                f"👤 {html.escape(display_name)} (<code>{user_id}</code>)\n"
+                f"📅 {chosen_day:%d.%m.%Y} · чат <code>{chat_id}</code>"
+                f"{detail}\n"
+                "ℹ️ Изменение учтётся в /stats и /yesterday. Уже отправленные отчёты не пересылаются.",
+                parse_mode="HTML",
+            )
 
         @dp.message(F.text, F.reply_to_message)
         async def on_manual_reply(message: Message) -> None:
@@ -477,6 +632,7 @@ async def main() -> None:
                 note = message.video_note
                 details = [
                     "🔎 <b>Gemini: диагностика видео</b>",
+                    f"🧠 Модель отладки: <code>{DEBUG_GEMINI_MODEL}</code>",
                     f"🎬 Длительность видео: {note.duration} с",
                     (
                         f"💾 Размер: {note.file_size / (1024 * 1024):.2f} МБ"
@@ -516,7 +672,8 @@ async def main() -> None:
                             analysis_started = time.perf_counter()
                             try:
                                 analysis = await asyncio.to_thread(
-                                    analyze_video, target, duration_seconds=note.duration
+                                    analyze_video, target, duration_seconds=note.duration,
+                                    model_override=DEBUG_GEMINI_MODEL
                                 )
                             finally:
                                 analysis_seconds = time.perf_counter() - analysis_started
@@ -592,10 +749,6 @@ async def main() -> None:
                     if analysis.finish_reason:
                         details.append(
                             f"🛑 Причина завершения: {html.escape(analysis.finish_reason)}"
-                        )
-                    if analysis.max_output_tokens is not None:
-                        details.append(
-                            f"🔒 Настроенный лимит output tokens: {analysis.max_output_tokens}"
                         )
 
                 details.append("🧪 Тестовый режим: результат не записан в статистику.")

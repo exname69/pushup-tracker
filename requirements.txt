@@ -3,12 +3,4 @@ APScheduler==3.11.0
 python-dotenv==1.0.1
 numpy==1.26.4
 opencv-contrib-python==4.10.0.84
-
-# Linux ARM64 (Docker на Mac Apple Silicon, ARM VPS)
-mediapipe==0.10.18; sys_platform == "linux" and platform_machine == "aarch64"
-
-# Linux x86_64 (обычный VPS)
-mediapipe==0.10.21; sys_platform == "linux" and platform_machine == "x86_64"
-
-# macOS (если запускаем Python без Docker)
-mediapipe==0.10.21; sys_platform == "darwin"
+google-genai>=1.0,<2.0

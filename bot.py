@@ -568,10 +568,10 @@ async def main() -> None:
             )
             await message.reply(
                 f"{action_text}\n"
-                f"👤 {html.escape(display_name)} (<code>{user_id}</code>)\n"
-                f"📅 {chosen_day:%d.%m.%Y} · чат <code>{chat_id}</code>"
+                f"👤 {html.escape(display_name)}\n"
+                f"📅 {chosen_day:%d.%m.%Y}\n"
                 f"{detail}\n"
-                "ℹ️ Изменение учтётся в /stats и /yesterday. Уже отправленные отчёты не пересылаются.",
+                "ℹ️ Изменение учтётся в /stats и /yesterday.",
                 parse_mode="HTML",
             )
 

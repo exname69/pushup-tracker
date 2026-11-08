@@ -399,9 +399,10 @@ async def main() -> None:
                 "DAILY_TARGET": str(daily_target),
                 "REPORT_TIMEZONE": tz.key,
                 "PENALTY_TARGET": str(daily_target * 2 + 10),
+                "CASH_FINE": str(cash_fine),
             }
             rules = re.sub(
-                r"\{(DAILY_TARGET|REPORT_TIMEZONE|PENALTY_TARGET)\}",
+                r"\{(DAILY_TARGET|REPORT_TIMEZONE|PENALTY_TARGET|CASH_FINE)\}",
                 lambda match: variables[match.group(1)],
                 rules,
             )

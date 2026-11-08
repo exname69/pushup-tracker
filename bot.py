@@ -1,5 +1,3 @@
-"""Telegram push-up tracker: automatic analysis with persistent manual fallback."""
-
 from __future__ import annotations
 
 import asyncio
@@ -48,37 +46,69 @@ def setup_manual_storage(db: Storage) -> None:
         )
 
 
-def daily_report_rows(db: Storage, chat_id: int, day: date, tz: ZoneInfo) -> list[tuple[str, int, int, int]]:
-    """Per-user (name, reps, videos, manual videos), without name collisions."""
-    start = datetime.combine(day, datetime.min.time(), tzinfo=tz).astimezone(timezone.utc).isoformat()
-    end = datetime.combine(day + timedelta(days=1), datetime.min.time(), tzinfo=tz).astimezone(timezone.utc).isoformat()
-    return db.conn.execute(
+def daily_report_rows(
+    db: Storage, chat_id: int, day: date, tz: ZoneInfo, daily_target: int = 100
+) -> list[tuple[str, int, int, int, int]]:
+    """Return (name, reps, videos, manual_videos, goal) for each known member.
+
+    Any missed *effective* daily goal makes the next day's goal 3x the base.
+    The multiplier does not compound: 100 -> 300 -> 300 until the goal is met.
+    No missed days are assigned before a member's first recorded video.
+    """
+    end_utc = datetime.combine(
+        day + timedelta(days=1), datetime.min.time(), tzinfo=tz
+    ).astimezone(timezone.utc).isoformat()
+    video_rows = db.conn.execute(
         """
-        SELECT m.display_name, SUM(v.count), COUNT(*), SUM(v.is_manual)
+        SELECT m.user_id, m.display_name, v.count, v.is_manual, v.sent_at_utc
         FROM video_counts v
         JOIN members m ON m.chat_id = v.chat_id AND m.user_id = v.user_id
-        WHERE v.chat_id=? AND v.sent_at_utc >= ? AND v.sent_at_utc < ?
-        GROUP BY v.user_id
-        ORDER BY SUM(v.count) DESC, COUNT(*) DESC, m.display_name COLLATE NOCASE
+        WHERE v.chat_id = ? AND v.sent_at_utc < ?
+        ORDER BY m.display_name COLLATE NOCASE, m.user_id, v.sent_at_utc
         """,
-        (chat_id, start, end),
+        (chat_id, end_utc),
     ).fetchall()
 
+    members: dict[int, dict] = {}
+    for user_id, name, count, manual, timestamp in video_rows:
+        video_day = datetime.fromisoformat(timestamp).astimezone(tz).date()
+        member = members.setdefault(user_id, {"name": name, "first": video_day, "days": {}})
+        totals = member["days"].setdefault(video_day, [0, 0, 0])
+        totals[0] += count
+        totals[1] += 1
+        totals[2] += manual
 
-def report_text(day: date, rows: list[tuple[str, int, int, int]]) -> str:
-    lines = [f"🏋️ <b>Отжимания за {day:%d.%m.%Y}</b>", ""]
-    for i, (name, count, videos, manual) in enumerate(rows, 1):
-        suffix = f", ✍️ {manual} вручную" if manual else ""
-        lines.append(f"{i}. <b>{html.escape(name)}</b> — {count} ({videos} круж.{suffix})")
-    if not rows:
-        lines.append("За этот день учтённых кружочков не было.")
-    lines += [
+    result = []
+    for member in sorted(members.values(), key=lambda m: m["name"].casefold()):
+        current_day = member["first"]
+        goal = daily_target
+        while current_day < day:
+            done = member["days"].get(current_day, [0])[0]
+            goal = daily_target if done >= goal else daily_target * 2 + 10
+            current_day += timedelta(days=1)
+        reps, videos, manual = member["days"].get(day, [0, 0, 0])
+        result.append((member["name"], reps, videos, manual, goal))
+    return result
+
+
+def report_text(day: date, rows: list[tuple[str, int, int, int, int]], target: int = 100) -> str:
+    lines = [
+        f"🏋️ <b>Отжимания за {day:%d.%m.%Y}</b>",
+        f"🎯 Обычная норма: <b>{target}</b> отжиманий",
         "",
-        f"<b>Всего:</b> {sum(x[1] for x in rows)} отжиманий / {sum(x[2] for x in rows)} кружочков",
     ]
-    total_manual = sum(x[3] for x in rows)
-    if total_manual:
-        lines.append(f"✍️ Вручную указано: {total_manual} круж. (при желании проверьте видео)")
+    for name, count, videos, manual, goal in rows:
+        status = "✅" if count >= goal else "❌"
+        suffix = f" · ✍️ {manual} вручную" if manual else ""
+        lines.append(f"{status} <b>{html.escape(name)}</b> — {count}/{goal} · 🎥 {videos}{suffix}")
+        if goal > target:
+            lines.append(f"   🔥 <b>СЕГОДНЯ ШТРАФНАЯ НОРМА: {goal}!</b>")
+        if count < goal:
+            lines.append(f"   🚨 <b>НА {day + timedelta(days=1):%d.%m} НАЗНАЧЕНА НОРМА ×2 + 10: {target * 3}!</b>")
+    if not rows:
+        lines.append("Пока нет зарегистрированных участников с кружочками.")
+    if any(manual for _, _, _, manual, _ in rows):
+        lines += ["", "✍️ Результаты введены вручную — их можно перепроверить по видео."]
     return "\n".join(lines)
 
 
@@ -88,6 +118,12 @@ async def main() -> None:
     if not token:
         raise RuntimeError("Укажите BOT_TOKEN в .env")
     tz = ZoneInfo(os.getenv("REPORT_TIMEZONE", "Europe/Zurich"))
+    try:
+        daily_target = int(os.getenv("DAILY_TARGET", "100"))
+    except ValueError as exc:
+        raise ValueError("DAILY_TARGET должен быть целым положительным числом") from exc
+    if daily_target <= 0:
+        raise ValueError("DAILY_TARGET должен быть больше нуля")
     db = Storage(os.getenv("DB_PATH", "./data/pushups.sqlite3"))
     setup_manual_storage(db)
     dp = Dispatcher()
@@ -95,7 +131,7 @@ async def main() -> None:
     report_lock = asyncio.Lock()
 
     def get_report(chat_id: int, day: date) -> str:
-        return report_text(day, daily_report_rows(db, chat_id, day, tz))
+        return report_text(day, daily_report_rows(db, chat_id, day, tz, daily_target), daily_target)
 
     async with Bot(token=token) as bot:
         async def ask_manual(message: Message, reason: str) -> None:
@@ -166,11 +202,11 @@ async def main() -> None:
             if message.chat.type in ("group", "supergroup"):
                 db.register_chat(message.chat.id, message.chat.title or "Группа")
             await message.answer(
-                "🏋️ Пришлите видеокружочек с отжиманиями. Я посчитаю повторы и соберу рейтинг.\n"
+                "🏋️ Пришлите видеокружочек с отжиманиями. Я посчитаю повторы и отмечу выполнение дневной нормы.\n"
                 "Если видео не распознаётся, попрошу автора написать число вручную. "
                 "Такие результаты помечаются ✍️ и их можно проверить.\n"
                 "Команды: /stats — сегодня, /yesterday — вчера. "
-                f"Ежедневный отчёт — в 00:00 ({tz.key})."
+                f"Дневная норма: {daily_target}. Отчёт — в 00:00 ({tz.key})."
             )
 
         @dp.message(Command("stats", "yesterday"))
@@ -232,7 +268,7 @@ async def main() -> None:
         @dp.message(F.video_note)
         async def on_video_note(message: Message) -> None:
             if message.chat.type not in ("group", "supergroup"):
-                await message.answer("Добавьте меня в группу: там я считаю отжимания и публикую рейтинг.")
+                await message.answer("Добавьте меня в группу: там я считаю отжимания и публикую выполнение дневной нормы.")
                 return
             if not message.from_user or message.from_user.is_bot:
                 return

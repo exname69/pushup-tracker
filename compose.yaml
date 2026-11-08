@@ -2,12 +2,23 @@ services:
   bot:
     build: .
     restart: unless-stopped
+
     env_file:
       - .env
-    volumes:
-      - pushup-data:/data
-    environment:
-      DB_PATH: /data/pushups.sqlite3
 
-volumes:
-  pushup-data:
+    environment:
+      PYTHONUNBUFFERED: "1"
+      OMP_NUM_THREADS: "2"
+      OPENBLAS_NUM_THREADS: "1"
+
+    volumes:
+      - ./data:/app/data
+
+    mem_limit: 1536m
+    cpus: 2.0
+
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"

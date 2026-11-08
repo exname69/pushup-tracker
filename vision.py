@@ -1,16 +1,17 @@
-"""Подсчёт отжиманий на видео с фронтального, бокового и диагонального ракурса.
+"""Оценка повторяющихся движений в видеокружочке без MediaPipe.
 
-Для анализа достаточно видимых плеч и рук; ноги не обязательны.
-Счётчик ориентирован на циклы движения, а не на идеальную технику.
-При недостаточно надёжном видео возвращает None (для ручного ввода ботом).
+OpenCV отслеживает контрастные точки (оптический поток Lucas–Kanade),
+ищет согласованные циклы их перемещения по X, Y или изменения расстояния
+до центра кадра. Подходит для экспериментов с фронтальной/боковой съёмкой,
+но НЕ может доказать, что обнаруженное движение — именно отжимание. Скорее как счетчик сделан.
+
+Если надёжного согласия точек нет, возвращает None: бот запросит ручной ввод.
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-from math import acos, degrees, hypot, isfinite, sqrt
+from dataclasses import dataclass, field
 from pathlib import Path
-from statistics import median
 
 
 @dataclass(frozen=True)
@@ -20,273 +21,243 @@ class Analysis:
     sampled_frames: int
 
 
-class PushupCounter:
-    """Совместимый с прежним кодом счётчик циклов по углу локтя."""
+@dataclass
+class _Track:
+    """История одной особенности изображения (в координатах кадра)."""
 
-    def __init__(self, down_angle: float = 105.0, up_angle: float = 155.0):
-        self.down_angle = down_angle
-        self.up_angle = up_angle
-        self.state = "unknown"
-        self.repetitions = 0
-        self._up_streak = 0
-        self._down_streak = 0
-        self._missing = 0
-
-    def update(self, elbow_angle: float | None) -> None:
-        if elbow_angle is None:
-            self._missing += 1
-            self._up_streak = self._down_streak = 0
-            if self._missing >= 8:
-                self.state = "unknown"
-            return
-        self._missing = 0
-        self._up_streak = self._up_streak + 1 if elbow_angle >= self.up_angle else 0
-        self._down_streak = self._down_streak + 1 if elbow_angle <= self.down_angle else 0
-        if self.state == "unknown" and self._up_streak >= 2:
-            self.state = "up"
-        elif self.state == "up" and self._down_streak >= 2:
-            self.state = "down"
-        elif self.state == "down" and self._up_streak >= 2:
-            self.state = "up"
-            self.repetitions += 1
+    observations: list[tuple[int, float, float]] = field(default_factory=list)
 
 
-def joint_angle(a: tuple[float, float], b: tuple[float, float], c: tuple[float, float]) -> float:
-    """Угол ABC в градусах, вершина — точка B."""
-    ba = (a[0] - b[0], a[1] - b[1])
-    bc = (c[0] - b[0], c[1] - b[1])
-    norm = hypot(*ba) * hypot(*bc)
-    if norm < 1e-8:
-        return 0.0
-    cos_value = (ba[0] * bc[0] + ba[1] * bc[1]) / norm
-    return degrees(acos(max(-1.0, min(1.0, cos_value))))
+def _smooth(values):
+    """Сглаживание, не искажающее края короткой последовательности."""
+    import numpy as np
+
+    if len(values) < 5:
+        return values
+    padded = np.pad(values, (2, 2), mode="edge")
+    return np.convolve(padded, np.array([1, 2, 3, 2, 1]) / 9, mode="valid")
 
 
-def _angle_3d(a, b, c) -> float | None:
-    ab = (a.x - b.x, a.y - b.y, a.z - b.z)
-    cb = (c.x - b.x, c.y - b.y, c.z - b.z)
-    norm_a = sqrt(sum(v * v for v in ab))
-    norm_c = sqrt(sum(v * v for v in cb))
-    if norm_a < 1e-6 or norm_c < 1e-6:
+def _count_cycles(values, fps: float, min_amplitude: float = 2.5) -> tuple[int, float]:
+    """Количество полных циклов «край A → край B → край A».
+
+    Порог определяется амплитудой движения конкретной точки, а не
+    абсолютной величиной её координаты. Считаем в обоих направлениях.
+    """
+    import numpy as np
+
+    if len(values) < max(12, round(fps * 1.8)):
+        return 0, 0.0
+    smoothed = _smooth(np.asarray(values, dtype=np.float64))
+    lo, hi = np.percentile(smoothed, [20, 80])
+    span = float(hi - lo)
+    if span < min_amplitude:
+        return 0, 0.0
+
+    low = lo + 0.20 * span
+    high = hi - 0.20 * span
+    # Два наблюдения подряд: защита от кратковременных скачков трекера.
+    dwell = max(2, round(fps * 0.13))
+    min_cycle = round(fps * 0.55)
+    max_cycle = round(fps * 10)
+
+    state = None
+    last_endpoint_index = None
+    endpoints: list[int] = []
+    streak_low = streak_high = 0
+    min_half = max(2, round(fps * 0.17))
+
+    for index, value in enumerate(smoothed):
+        streak_low = streak_low + 1 if value <= low else 0
+        streak_high = streak_high + 1 if value >= high else 0
+        endpoint = "low" if streak_low >= dwell else "high" if streak_high >= dwell else None
+        if endpoint is None or endpoint == state:
+            continue
+        if last_endpoint_index is not None and index - last_endpoint_index < min_half:
+            continue
+        state = endpoint
+        last_endpoint_index = index
+        endpoints.append(index)
+
+    # Считаем по паре противоположных крайних положений на цикл.
+    # Это устойчивее к записи, начавшейся посередине первого повтора.
+    if len(endpoints) < 3:
+        return 0, 0.0
+    full_cycle_durations = [endpoints[i + 2] - endpoints[i] for i in range(len(endpoints) - 2)]
+    correct = [min_cycle <= duration <= max_cycle for duration in full_cycle_durations]
+    if sum(correct) < max(1, int(0.70 * len(correct))):
+        return 0, 0.0
+    count = len(endpoints) // 2
+
+    return count, min(span / (min_amplitude * 3.0), 1.0)
+
+
+def _choose_count(tracks: dict[int, _Track], frames: int, fps: float, size: tuple[int, int]) -> int | None:
+    """Голосование движущихся точек. Неподвижный фон не участвует."""
+    import numpy as np
+
+    w, h = size
+    votes: list[tuple[int, float]] = []
+    for track in tracks.values():
+        history = track.observations
+        if len(history) < max(round(2.5 * fps), round(frames * 0.60)):
+            continue
+        # Не экстраполируем по короткому фрагменту на всё видео.
+        if history[0][0] > frames * 0.12 or history[-1][0] < frames * 0.88:
+            continue
+
+        _, x, y = np.array(history, dtype=float).T
+        radius = np.hypot(x - w / 2.0, y - h / 2.0)
+        choices = [_count_cycles(series, fps) for series in (x, y, radius)]
+        # Предпочитаем наиболее выраженный периодический сигнал.
+        best_count, quality = max(choices, key=lambda result: (result[0] > 0, result[1], result[0]))
+        if best_count > 0 and quality >= 0.35:
+            votes.append((best_count, quality))
+
+    if len(votes) < 6:
         return None
-    cos_value = sum(x * y for x, y in zip(ab, cb)) / (norm_a * norm_c)
-    return degrees(acos(max(-1.0, min(1.0, cos_value))))
 
-
-def _extract_signals(pose_landmarks, pose_world_landmarks, indices) -> dict[str, float]:
-    """Извлекает альтернативные признаки «вниз», не требуя видимых ног.
-
-    - elbow_3d: сгибание локтя в 3D (лучше для фронтальной съёмки);
-    - elbow_2d: сгибание локтя в плоскости изображения;
-    - body: приближение плеч к кистям относительно масштаба плеч.
-
-    У разных ракурсов надёжными оказываются разные признаки.
-    """
-    landmarks = pose_landmarks.landmark
-    world = pose_world_landmarks.landmark if pose_world_landmarks is not None else None
-    signals: dict[str, list[float]] = {"elbow_3d": [], "elbow_2d": [], "body": []}
-    shoulders = []
-
-    for side in ("LEFT", "RIGHT"):
-        sh = landmarks[indices[f"{side}_SHOULDER"].value]
-        el = landmarks[indices[f"{side}_ELBOW"].value]
-        wr = landmarks[indices[f"{side}_WRIST"].value]
-        if sh.visibility >= 0.45:
-            shoulders.append(sh)
-        if min(sh.visibility, el.visibility, wr.visibility) < 0.45:
-            continue
-
-        angle_2d = joint_angle((sh.x, sh.y), (el.x, el.y), (wr.x, wr.y))
-        signals["elbow_2d"].append(180.0 - angle_2d)
-
-        if world is not None:
-            ws = world[indices[f"{side}_SHOULDER"].value]
-            we = world[indices[f"{side}_ELBOW"].value]
-            ww = world[indices[f"{side}_WRIST"].value]
-            angle_3d = _angle_3d(ws, we, ww)
-            if angle_3d is not None:
-                signals["elbow_3d"].append(180.0 - angle_3d)
-
-        signals["body"].append(hypot(sh.x - wr.x, sh.y - wr.y))
-
-    output: dict[str, float] = {}
-    for key in ("elbow_2d", "elbow_3d"):
-        if signals[key]:
-            output[key] = median(signals[key])
-
-    # Нормализуем расстояние плечо–кисть по ширине плеч. Если одно плечо
-    # закрыто, берём только угловые признаки: масштаб иначе ненадёжен.
-    if len(shoulders) == 2 and signals["body"]:
-        width = hypot(shoulders[0].x - shoulders[1].x, shoulders[0].y - shoulders[1].y)
-        if width > 0.035:
-            output["body"] = -median(signals["body"]) / width
-    return output
-
-
-def _filled_smoothed(values: list[float | None], max_gap: int = 3) -> list[float | None]:
-    """Заполняет короткие пропуски линейно и подавляет дрожание landmarks."""
-    result = values[:]
-    points = [i for i, value in enumerate(result) if value is not None]
-    for a, b in zip(points, points[1:]):
-        if 1 < b - a <= max_gap + 1:
-            va, vb = result[a], result[b]
-            for i in range(a + 1, b):
-                result[i] = va + (vb - va) * (i - a) / (b - a)
-    # Медиана из трёх кадров; длинные пропуски остаются разрывами.
-    median_filtered = []
-    for i, value in enumerate(result):
-        if value is None:
-            median_filtered.append(None)
-            continue
-        neighbors = [result[j] for j in range(max(0, i - 1), min(len(result), i + 2)) if result[j] is not None]
-        median_filtered.append(median(neighbors))
-    return median_filtered
-
-
-def _percentile(values: list[float], fraction: float) -> float:
-    sorted_values = sorted(values)
-    position = (len(sorted_values) - 1) * fraction
-    lo = int(position)
-    hi = min(lo + 1, len(sorted_values) - 1)
-    return sorted_values[lo] * (hi - position) + sorted_values[hi] * (position - lo) if hi != lo else sorted_values[lo]
-
-
-def _count_cycles(values: list[float | None], fps: float, kind: str) -> tuple[int, float]:
-    """Считает устойчивые циклы верх–низ–верх с гистерезисом.
-
-    Возвращает (количество, качество сигнала). Качество не является
-    вероятностью и не должно показываться как процент точности.
-    """
-    actual = [v for v in values if v is not None and isfinite(v)]
-    if len(actual) < max(10, int(fps * 1.5)):
-        return 0, 0.0
-
-    # Адаптируемся к масштабу движения, но не принимаем мелкий шум за повтор.
-    span = _percentile(actual, 0.90) - _percentile(actual, 0.10)
-    minimum_span = 23.0 if kind.startswith("elbow") else 0.30
-    if span < minimum_span:
-        return 0, 0.0
-
-    low = _percentile(actual, 0.20)
-    high = _percentile(actual, 0.80)
-    delta = high - low
-    if delta < minimum_span * 0.60:
-        return 0, 0.0
-    up_threshold = low + delta * 0.32
-    down_threshold = low + delta * 0.68
-
-    state = "unknown"
-    up_streak = down_streak = 0
-    last_up_frame = None
-    bottom_frame = None
-    reps = 0
-    gap = 0
-    min_half = max(2, round(fps * 0.18))
-    min_cycle = max(4, round(fps * 0.50))
-    max_cycle = round(fps * 12)
-
-    for i, value in enumerate(values):
-        if value is None:
-            gap += 1
-            up_streak = down_streak = 0
-            if gap >= max(5, int(fps * 0.8)):
-                state, last_up_frame, bottom_frame = "unknown", None, None
-            continue
-        gap = 0
-        up_streak = up_streak + 1 if value <= up_threshold else 0
-        down_streak = down_streak + 1 if value >= down_threshold else 0
-
-        if state == "unknown":
-            if up_streak >= min_half:
-                state = "up"
-                last_up_frame = i
-        elif state == "up" and down_streak >= min_half:
-            state = "down"
-            bottom_frame = i
-        elif state == "down" and up_streak >= min_half:
-            if last_up_frame is not None and bottom_frame is not None:
-                duration = i - last_up_frame
-                if min_cycle <= duration <= max_cycle:
-                    reps += 1
-            state = "up"
-            last_up_frame = i
-            bottom_frame = None
-
-    coverage = len(actual) / len(values) if values else 0.0
-    strength = min(span / (minimum_span * 2.0), 1.0)
-    return reps, coverage * strength
-
-
-def _pick_count(signals: dict[str, list[float | None]], sample_fps: float) -> tuple[int, float]:
-    """Выбирает наиболее надёжный признак; не суммирует повторы разных каналов."""
-    choices = []
-    for kind, readings in signals.items():
-        smoothed = _filled_smoothed(readings)
-        count, quality = _count_cycles(smoothed, sample_fps, kind)
-        # Слегка предпочитаем локтевые углы движениям корпуса.
-        priority = 1.10 if kind == "elbow_3d" else 1.05 if kind == "elbow_2d" else 1.0
-        choices.append((quality * priority, count, kind))
-    best = max(choices, default=(0.0, 0, ""))
-    return best[1], best[0]
+    counts = np.asarray([count for count, _ in votes], dtype=int)
+    # В оптическом потоке соседние точки иногда пропускают один цикл.
+    # Не считаем «лидера» — берём медиану независимых наблюдений.
+    estimate = int(round(float(np.median(counts))))
+    tolerance = max(1, round(estimate * 0.18))
+    supporters = sum(abs(count - estimate) <= tolerance for count in counts)
+    if estimate < 1 or supporters < max(6, round(len(votes) * 0.60)):
+        return None
+    return estimate
 
 
 def analyze_video(path: str | Path, target_fps: int = 10) -> Analysis | None:
-    """Анализирует видео. None — недостаточно данных для автоматического подсчёта.
+    """Оценивает циклы движения, возвращает None при неоднозначном видео.
 
-    FPS ограничен для VPS с 2 vCPU; ноги не требуются. Анализ выполняется
-    синхронно, вызывающий код может запускать его через asyncio.to_thread().
+    Сигнатура и структура Analysis совместимы с существующим bot.py.
+    Видеофайл не загружается в сторонние сервисы.
     """
     import cv2
-    import mediapipe as mp
+    import numpy as np
 
-    cap = cv2.VideoCapture(str(path))
-    if not cap.isOpened():
+    video = cv2.VideoCapture(str(path))
+    if not video.isOpened():
         return None
 
-    raw_fps = cap.get(cv2.CAP_PROP_FPS)
-    raw_fps = raw_fps if 1 <= raw_fps <= 120 else 25.0
-    frame_step = max(1, round(raw_fps / max(1, target_fps)))
-    sample_fps = raw_fps / frame_step
-    sampled = valid = index = 0
-    signals: dict[str, list[float | None]] = {"elbow_2d": [], "elbow_3d": [], "body": []}
-    pose_api = mp.solutions.pose
+    source_fps = video.get(cv2.CAP_PROP_FPS)
+    source_fps = source_fps if 1 <= source_fps <= 120 else 25.0
+    step = max(1, round(source_fps / max(1, target_fps)))
+    effective_fps = source_fps / step
+    index = 0
+    sampled = 0
+    valid = 0
+    previous = None
+    prev_points = None
+    point_ids: list[int] = []
+    tracks: dict[int, _Track] = {}
+    next_id = 0
+    image_size = None
+    mask = None
+
+    def add_points(gray, active):
+        nonlocal next_id
+        # Ищем новые особенности на теле, если ранее отслеживаемые исчезли.
+        current_mask = mask.copy()
+        if len(active):
+            for x, y in active.reshape(-1, 2):
+                cv2.circle(current_mask, (int(x), int(y)), 7, 0, thickness=-1)
+        candidates = cv2.goodFeaturesToTrack(
+            gray, maxCorners=min(200 - len(active), 120),
+            qualityLevel=0.012, minDistance=6, mask=current_mask, blockSize=5,
+        )
+        if candidates is None:
+            return active, []
+        new_ids = []
+        for candidate in candidates.reshape(-1, 2):
+            tracks[next_id] = _Track([(sampled - 1, float(candidate[0]), float(candidate[1]))])
+            new_ids.append(next_id)
+            next_id += 1
+        appended = candidates.astype(np.float32).reshape(-1, 1, 2)
+        return (np.concatenate([active, appended], axis=0) if len(active) else appended), new_ids
 
     try:
-        with pose_api.Pose(
-            static_image_mode=False,
-            model_complexity=1,
-            smooth_landmarks=True,
-            min_detection_confidence=0.50,
-            min_tracking_confidence=0.60,
-        ) as pose:
-            while True:
-                ok, frame = cap.read()
-                if not ok:
-                    break
-                if index % frame_step != 0:
-                    index += 1
-                    continue
-                index += 1
-                sampled += 1
-                rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                rgb.flags.writeable = False
-                result = pose.process(rgb)
-                features = (
-                    _extract_signals(result.pose_landmarks, result.pose_world_landmarks, pose_api.PoseLandmark)
-                    if result.pose_landmarks is not None else {}
-                )
-                if features:
+        while True:
+            ok, frame = video.read()
+            if not ok:
+                break
+            index += 1
+            if (index - 1) % step:
+                continue
+            sampled += 1
+            height, width = frame.shape[:2]
+            if min(width, height) <= 0:
+                continue
+            scale = 300 / max(width, height)
+            if scale < 1:
+                frame = cv2.resize(frame, (round(width * scale), round(height * scale)), interpolation=cv2.INTER_AREA)
+            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            gray = cv2.GaussianBlur(gray, (3, 3), 0)
+
+            if previous is None:
+                h, w = gray.shape
+                image_size = (w, h)
+                mask = np.zeros((h, w), dtype=np.uint8)
+                # У видеокружочков края обычно чёрные; работаем в центре круга.
+                cv2.ellipse(mask, (w // 2, h // 2), (int(w * 0.42), int(h * 0.42)), 0, 0, 360, 255, -1)
+                prev_points = np.empty((0, 1, 2), dtype=np.float32)
+                prev_points, point_ids = add_points(gray, prev_points)
+                previous = gray
+                if len(point_ids) >= 10:
                     valid += 1
-                for key in signals:
-                    signals[key].append(features.get(key))
+                continue
+
+            if gray.shape != previous.shape:
+                break
+
+            surviving = np.empty((0, 1, 2), dtype=np.float32)
+            surviving_ids: list[int] = []
+            if len(prev_points):
+                moved, status, _ = cv2.calcOpticalFlowPyrLK(
+                    previous, gray, prev_points, None,
+                    winSize=(21, 21), maxLevel=2,
+                    criteria=(cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 22, 0.02),
+                )
+                if moved is not None and status is not None:
+                    backward, back_status, _ = cv2.calcOpticalFlowPyrLK(
+                        gray, previous, moved, None,
+                        winSize=(21, 21), maxLevel=2,
+                        criteria=(cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 22, 0.02),
+                    )
+                    if backward is not None and back_status is not None:
+                        fb_error = np.linalg.norm(prev_points.reshape(-1, 2) - backward.reshape(-1, 2), axis=1)
+                        okay = (
+                            (status.reshape(-1) == 1) &
+                            (back_status.reshape(-1) == 1) &
+                            (fb_error < 2.0) &
+                            np.isfinite(moved.reshape(-1, 2)).all(axis=1)
+                        )
+                        candidates = moved.reshape(-1, 2)
+                        h, w = gray.shape
+                        okay &= (candidates[:, 0] >= 4) & (candidates[:, 0] < w - 4)
+                        okay &= (candidates[:, 1] >= 4) & (candidates[:, 1] < h - 4)
+                        surviving = moved[okay].reshape(-1, 1, 2)
+                        surviving_ids = [point_id for point_id, good in zip(point_ids, okay) if good]
+                        for point_id, (x, y) in zip(surviving_ids, surviving.reshape(-1, 2)):
+                            tracks[point_id].observations.append((sampled - 1, float(x), float(y)))
+
+            if len(surviving_ids) >= 10:
+                valid += 1
+            if len(surviving_ids) < 85 and sampled % max(4, round(effective_fps)) == 0:
+                surviving, added_ids = add_points(gray, surviving)
+                surviving_ids.extend(added_ids)
+            prev_points = surviving
+            point_ids = surviving_ids
+            previous = gray
     finally:
-        cap.release()
+        video.release()
 
-    if sampled < 10 or valid < 8 or valid / sampled < 0.35:
+    if sampled < max(12, round(effective_fps * 2.5)) or valid / max(1, sampled) < 0.65:
         return None
-
-    count, quality = _pick_count(signals, sample_fps)
-    # Без устойчивого движения лучше запросить ручной ввод, чем сохранить 0.
-    if quality < 0.22:
+    if image_size is None:
+        return None
+    count = _choose_count(tracks, sampled, effective_fps, image_size)
+    if count is None:
         return None
     return Analysis(repetitions=count, valid_frames=valid, sampled_frames=sampled)

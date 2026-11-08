@@ -492,14 +492,6 @@ async def main() -> None:
                     await message.answer("\n".join(details), parse_mode="HTML")
                     return
 
-                def field(obj, key, default=None):
-                    """Работает с dict, dataclass и объектами SDK Gemini."""
-                    if obj is None:
-                        return default
-                    if isinstance(obj, dict):
-                        return obj.get(key, default)
-                    return getattr(obj, key, default)
-
                 started = time.perf_counter()
                 queue_seconds = None
                 download_seconds = None
@@ -523,7 +515,9 @@ async def main() -> None:
                             phase = "анализ Gemini"
                             analysis_started = time.perf_counter()
                             try:
-                                analysis = await asyncio.to_thread(analyze_video, target)
+                                analysis = await asyncio.to_thread(
+                                    analyze_video, target, duration_seconds=note.duration
+                                )
                             finally:
                                 analysis_seconds = time.perf_counter() - analysis_started
                 except Exception as exc:
@@ -551,59 +545,54 @@ async def main() -> None:
                 elif analysis is None:
                     details.append("⚠️ Анализатор не вернул надёжный результат.")
                 else:
-                    count = field(analysis, "repetitions", field(analysis, "count"))
-                    uncertain = field(analysis, "uncertain")
-                    timestamps = field(analysis, "completed_at_seconds")
                     details.append("\n💪 <b>Результат</b>")
-                    details.append(f"Отжиманий: <b>{count}</b>" if count is not None else "Отжиманий: нет данных")
-                    if uncertain is not None:
-                        details.append(f"Неопределённость: {'⚠️ да' if uncertain else '✅ нет'}")
-                    if timestamps is not None:
-                        details.append(
-                            "Моменты завершения: "
-                            + (", ".join(f"{float(t):g} с" for t in timestamps) if timestamps else "нет")
+                    details.append(f"Отжиманий: <b>{analysis.repetitions}</b>")
+                    details.append(
+                        f"Неопределённость: {'⚠️ да' if analysis.uncertain else '✅ нет'}"
+                    )
+                    details.append(
+                        "Моменты завершения: "
+                        + (
+                            ", ".join(f"{timestamp:g} с" for timestamp in analysis.completed_at_seconds)
+                            if analysis.completed_at_seconds
+                            else "нет"
                         )
-                    details.append("✅ Ответ анализатора получен.")
-
-                    # Токены доступны только если vision.py возвращает usage_metadata
-                    # либо исходный объект response. Сам анализатор пока может их не пробрасывать.
-                    response = field(analysis, "response", field(analysis, "raw_response"))
-                    usage = field(analysis, "usage_metadata", field(analysis, "usage"))
-                    if usage is None:
-                        usage = field(response, "usage_metadata")
+                    )
+                    if analysis.requested_fps is not None:
+                        details.append(
+                            f"🎞 Заданная частота выборки видео: {analysis.requested_fps} FPS"
+                        )
+                    if analysis.api_seconds is not None:
+                        details.append(f"⚙️ Вызов Gemini API: {analysis.api_seconds:.2f} с")
+                    details.append(
+                        "⚠️ Gemini сообщил о неопределённости: результат не подтверждён."
+                        if analysis.uncertain
+                        else "✅ Ответ анализатора получен."
+                    )
 
                     details.append("\n🔢 <b>Использование токенов</b>")
+                    usage = analysis.usage_metadata
                     token_fields = (
-                        ("Вход", "prompt_token_count", "prompt_tokens"),
-                        ("Выход", "candidates_token_count", "output_tokens"),
-                        ("Thinking", "thoughts_token_count", "thinking_tokens"),
-                        ("Из кеша", "cached_content_token_count", "cached_tokens"),
-                        ("Всего", "total_token_count", "total_tokens"),
+                        ("Вход", "prompt_token_count"),
+                        ("Выход", "candidates_token_count"),
+                        ("Thinking", "thoughts_token_count"),
+                        ("Из кеша", "cached_content_token_count"),
+                        ("Всего", "total_token_count"),
                     )
-                    token_found = False
-                    for label, sdk_key, alternative in token_fields:
-                        value = field(usage, sdk_key)
-                        if value is None:
-                            value = field(analysis, alternative)
-                        if value is not None:
-                            details.append(f"{label}: {value}")
-                            token_found = True
-                    if not token_found:
-                        details.append("Недоступны: vision.py не передал usage_metadata.")
+                    if usage:
+                        for label, key in token_fields:
+                            value = usage.get(key)
+                            if value is not None:
+                                details.append(f"{label}: {value:,}".replace(",", " "))
+                    else:
+                        details.append("Метаданные токенов не предоставлены Gemini API.")
 
-                    model = field(analysis, "model", field(response, "model_version"))
-                    if model:
-                        details.append(f"🧠 Модель: {html.escape(str(model))}")
-                    finish_reason = field(analysis, "finish_reason")
-                    if finish_reason is None:
-                        candidates = field(response, "candidates")
-                        if candidates:
-                            finish_reason = field(candidates[0], "finish_reason")
-                    if finish_reason is not None:
-                        details.append(f"🛑 Причина завершения: {html.escape(str(finish_reason))}")
-                    output_limit = field(analysis, "max_output_tokens")
-                    if output_limit is not None:
-                        details.append(f"🔒 Настроенный лимит output tokens: {output_limit}")
+                    if analysis.model:
+                        details.append(f"🧠 Модель: {html.escape(analysis.model)}")
+                    if analysis.finish_reason:
+                        details.append(
+                            f"🛑 Причина завершения: {html.escape(analysis.finish_reason)}"
+                        )
 
                 details.append("🧪 Тестовый режим: результат не записан в статистику.")
                 await message.answer("\n".join(details), parse_mode="HTML")
@@ -626,13 +615,15 @@ async def main() -> None:
                     with tempfile.TemporaryDirectory(prefix="pushup-") as tempdir:
                         target = Path(tempdir) / "note.mp4"
                         await bot.download(note.file_id, destination=target, timeout=90)
-                        analysis = await asyncio.to_thread(analyze_video, target)
+                        analysis = await asyncio.to_thread(
+                            analyze_video, target, duration_seconds=note.duration
+                        )
             except Exception:
                 log.exception("Ошибка анализа кружочка chat=%s msg=%s", message.chat.id, message.message_id)
                 await ask_manual(message, "Не удалось обработать этот кружочек автоматически.")
                 return
 
-            if analysis is None:
+            if analysis is None or analysis.uncertain:
                 await ask_manual(message, "Не удалось уверенно распознать отжимания.")
                 return
 

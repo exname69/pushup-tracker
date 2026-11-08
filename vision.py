@@ -32,7 +32,7 @@ class Analysis:
 
 def analyze_video(
     path: str | Path,
-    target_fps: int = 15,
+    target_fps: int = 30,
     *,
     duration_seconds: float | None = None,
 ) -> Analysis | None:
@@ -58,57 +58,31 @@ def analyze_video(
         log.warning("Неверный размер видео: %d байт", size)
         return None
 
-    fps = max(14, min(int(target_fps), 16))
+    fps = max(24, min(int(target_fps), 30))
     model = os.getenv("GEMINI_MODEL", "gemini-3.5-flash-lite").strip()
 
+
     prompt = (
-        "Analyze the provided video and count ALL observable push-up-like repetitions. "
-        "Your primary goal is to count every distinct up-and-down movement cycle, "
-        "not to evaluate exercise technique or form. "
-        "IMPORTANT: Use very lenient counting criteria. "
-        "Count ALL repetitions, including partial push-ups, shallow movements, "
-        "short-range repetitions, fast repetitions, poorly executed push-ups, "
-        "and rhythmic body rocking that resembles push-up motion. "
-        "A full range of motion is NOT required. "
-        "The arms do NOT need to fully straighten or bend. "
-        "The chest does NOT need to approach or touch the floor. "
-        "The body does NOT need to remain perfectly straight. "
-        "Treat each distinct downward-and-upward movement of the torso, "
-        "shoulders, or upper body as one repetition, even when the movement "
-        "is small or the technique is incorrect. "
-        "Pay special attention to consecutive, repetitive movements. "
-        "DO NOT skip repetitions simply because they look nearly identical. "
-        "DO NOT merge multiple short or fast repetitions into a single repetition. "
-        "Count each clearly distinguishable movement cycle independently. "
-        "The camera may be frontal, the legs may be outside the frame, "
-        "and parts of the body may be obscured. "
-        "Use visible torso, shoulder, and arm movement to identify repetitions. "
-        "Do not require the entire body to be visible. "
-        "Analyze the entire video from beginning to end. "
-        "Track the repeating motion continuously and identify each upward "
-        "phase following a downward phase. "
-        "Record the timestamp in seconds when each upward movement is completed. "
-        "Do not count unrelated head movements, talking, or camera shaking "
-        "unless there is observable corresponding rhythmic upper-body movement. "
-        "Do not invent movements that are not visible. "
-        "Do not estimate repetitions from assumed exercise speed. "
-        "When a movement is visibly part of the repeated push-up-like motion, "
-        "prefer counting it rather than rejecting it due to imperfect technique. "
-        "Use uncertain=true only when the video is genuinely too ambiguous "
-        "to distinguish individual movement cycles. "
-        "Do not set uncertain=true merely because the technique is poor "
-        "or the range of motion is small. "
-        "Return strictly a valid JSON object with this exact structure: "
+        "Count ALL visible push-up-like movements in the video. "
+        "Count every distinct down-up body movement as one repetition, "
+        "including partial, shallow, fast, sloppy push-ups and rhythmic body rocking. "
+        "Accept ANY camera angle, especially frontal views. "
+        "Do NOT require proper technique, full arm extension, visible legs, "
+        "or the entire body to be in frame. "
+        "Track torso, shoulder, and arm movements. "
+        "Do NOT skip small, fast, or nearly identical repetitions. "
+        "Count every observable cycle exactly once, even with minimal movement. "
+        "Ignore unrelated movements and camera shake. "
+        "Never invent invisible repetitions or estimate by rhythm alone. "
+        "Record the completion time of each repetition in seconds. "
+        "Set uncertain=true only if individual movements cannot be distinguished. "
+        "Return ONLY valid JSON: "
         '{"count": 3, "completed_at_seconds": [2.4, 4.1, 6.3], "uncertain": false}. '
-        "Requirements: "
-        "count must exactly equal the length of completed_at_seconds. "
-        "Timestamps must be numeric, in seconds, and sorted chronologically. "
-        "If there are definitely no observable push-up-like movements, return "
-        '{"count": 0, "completed_at_seconds": [], "uncertain": false}. '
-        "Do not invent repetitions or timestamps. "
-        "Output only the raw JSON object. "
-        "No Markdown, code fences, explanations, or additional text."
+        "count MUST equal the number of timestamps, sorted chronologically. "
+        'If no repetitions are visible, return '
+        '{"count": 0, "completed_at_seconds": [], "uncertain": false}.'
     )
+
 
     response_schema = {
         "type": "OBJECT",

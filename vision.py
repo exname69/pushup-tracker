@@ -59,7 +59,7 @@ def analyze_video(
         return None
 
     fps = max(4, min(int(target_fps), 10))
-    model = os.getenv("GEMINI_MODEL", "gemini-3.5-flash-lite").strip()
+    model = os.getenv("GEMINI_MODEL", "gemini-3.8-flash").strip()
 
 
     prompt = (

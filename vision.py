@@ -32,7 +32,7 @@ class Analysis:
 
 def analyze_video(
     path: str | Path,
-    target_fps: int = 9,
+    target_fps: int = 15,
     *,
     duration_seconds: float | None = None,
 ) -> Analysis | None:
@@ -58,7 +58,7 @@ def analyze_video(
         log.warning("Неверный размер видео: %d байт", size)
         return None
 
-    fps = max(7, min(int(target_fps), 9))
+    fps = max(14, min(int(target_fps), 16))
     model = os.getenv("GEMINI_MODEL", "gemini-3.5-flash-lite").strip()
 
     prompt = (

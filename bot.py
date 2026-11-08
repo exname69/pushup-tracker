@@ -4,14 +4,15 @@ import asyncio
 import html
 import logging
 import os
+import re
 import tempfile
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
-from aiogram import Bot, Dispatcher, F
+from aiogram import BaseMiddleware, Bot, Dispatcher, F
 from aiogram.filters import Command
-from aiogram.types import ForceReply, Message
+from aiogram.types import ChatMemberUpdated, ForceReply, Message
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from dotenv import load_dotenv
 
@@ -44,6 +45,102 @@ def setup_manual_storage(db: Storage) -> None:
             )
             """
         )
+
+
+def parse_id_list(raw: str, label: str) -> set[int]:
+    """Разобрать список ID из .env, не допуская ошибочную конфигурацию."""
+    result = set()
+    for item in raw.split(","):
+        item = item.strip()
+        if not item:
+            continue
+        try:
+            result.add(int(item))
+        except ValueError as exc:
+            raise ValueError(f"В {label} указан некорректный ID: {item!r}") from exc
+    return result
+
+
+class AccessControl:
+    """Белые списки из .env с постоянными переопределениями в SQLite."""
+
+    def __init__(self, db: Storage, owner_id: int) -> None:
+        self.db = db
+        self.owner_id = owner_id
+        self.env_groups = parse_id_list(os.getenv("ALLOWED_CHAT_IDS", ""), "ALLOWED_CHAT_IDS")
+        self.env_users = parse_id_list(os.getenv("ALLOWED_USER_IDS", ""), "ALLOWED_USER_IDS")
+        with db.conn:
+            db.conn.execute(
+                """CREATE TABLE IF NOT EXISTS access_rules (
+                    kind TEXT NOT NULL CHECK(kind IN ('group', 'user')),
+                    target_id INTEGER NOT NULL,
+                    enabled INTEGER NOT NULL CHECK(enabled IN (0, 1)),
+                    PRIMARY KEY(kind, target_id)
+                )"""
+            )
+
+    def allowed(self, kind: str, target_id: int) -> bool:
+        # Решение владельца из БД имеет приоритет над начальными значениями .env.
+        if kind == "user" and target_id == self.owner_id:
+            return True
+        row = self.db.conn.execute(
+            "SELECT enabled FROM access_rules WHERE kind=? AND target_id=?",
+            (kind, target_id),
+        ).fetchone()
+        if row is not None:
+            return bool(row[0])
+        return target_id in (self.env_groups if kind == "group" else self.env_users)
+
+    def set_allowed(self, kind: str, target_id: int, enabled: bool) -> None:
+        if kind == "user" and target_id == self.owner_id and not enabled:
+            raise ValueError("Нельзя запретить доступ владельцу")
+        with self.db.conn:
+            self.db.conn.execute(
+                """INSERT INTO access_rules(kind, target_id, enabled) VALUES(?, ?, ?)
+                   ON CONFLICT(kind, target_id) DO UPDATE SET enabled=excluded.enabled""",
+                (kind, target_id, int(enabled)),
+            )
+
+    def list_allowed(self, kind: str) -> list[int]:
+        baseline = self.env_groups if kind == "group" else (self.env_users | {self.owner_id})
+        ids = set(baseline)
+        for target_id, enabled in self.db.conn.execute(
+            "SELECT target_id, enabled FROM access_rules WHERE kind=?", (kind,)
+        ):
+            if enabled:
+                ids.add(target_id)
+            else:
+                ids.discard(target_id)
+        return sorted(ids)
+
+
+class AccessMiddleware(BaseMiddleware):
+    """Проверять доступ ДО выполнения любых обработчиков сообщения."""
+
+    def __init__(self, access: AccessControl) -> None:
+        self.access = access
+        self.leaving: set[int] = set()
+
+    async def __call__(self, handler, event: Message, data: dict):
+        chat = event.chat
+        if chat.type == "private":
+            if not event.from_user or not self.access.allowed("user", event.from_user.id):
+                return None  # Посторонним в личке ничего не отвечаем.
+        elif chat.type in ("group", "supergroup"):
+            if not self.access.allowed("group", chat.id):
+                if chat.id not in self.leaving:
+                    self.leaving.add(chat.id)
+                    try:
+                        log.warning("Выход из неразрешённой группы %s (%s)", chat.id, chat.title)
+                        await data["bot"].leave_chat(chat.id)
+                    except Exception:
+                        log.exception("Не удалось выйти из группы %s", chat.id)
+                    finally:
+                        self.leaving.discard(chat.id)
+                return None
+        else:
+            return None
+        return await handler(event, data)
 
 
 def daily_report_rows(
@@ -122,9 +219,18 @@ async def main() -> None:
         raise ValueError("DAILY_TARGET должен быть целым положительным числом") from exc
     if daily_target <= 0:
         raise ValueError("DAILY_TARGET должен быть больше нуля")
+    try:
+        owner_id = int(os.getenv("OWNER_ID", "0"))
+    except ValueError as exc:
+        raise ValueError("OWNER_ID должен быть числовым Telegram User ID") from exc
+    if owner_id <= 0:
+        raise RuntimeError("Укажите OWNER_ID в .env: бот работает только с заданным владельцем")
+
     db = Storage(os.getenv("DB_PATH", "./data/pushups.sqlite3"))
     setup_manual_storage(db)
+    access = AccessControl(db, owner_id)
     dp = Dispatcher()
+    dp.message.outer_middleware(AccessMiddleware(access))
     semaphore = asyncio.Semaphore(2)
     report_lock = asyncio.Lock()
 
@@ -186,6 +292,8 @@ async def main() -> None:
             async with report_lock:
                 yesterday = datetime.now(tz).date() - timedelta(days=1)
                 for chat_id in db.chat_ids():
+                    if not access.allowed("group", chat_id):
+                        continue
                     first_seen = db.chat_first_seen(chat_id)
                     if first_seen is None or first_seen.astimezone(tz).date() > yesterday:
                         continue
@@ -197,6 +305,69 @@ async def main() -> None:
                         log.exception("Не удалось отправить отчёт в чат %s", chat_id)
                     else:
                         db.mark_report_sent(chat_id, yesterday)
+
+        @dp.my_chat_member()
+        async def on_bot_membership(event: ChatMemberUpdated) -> None:
+            """Сразу покинуть любую новую группу, которой нет в белом списке."""
+            if event.chat.type not in ("group", "supergroup"):
+                return
+            if event.new_chat_member.status not in ("member", "administrator"):
+                return
+            if not access.allowed("group", event.chat.id):
+                log.warning(
+                    "Бот добавлен в чужую группу: %s (%s). Для разрешения: /allowgroup %s",
+                    event.chat.id, event.chat.title, event.chat.id,
+                )
+                try:
+                    await bot.leave_chat(event.chat.id)
+                except Exception:
+                    log.exception("Не удалось выйти из неразрешённой группы %s", event.chat.id)
+
+        @dp.message(Command("myid"))
+        async def on_myid(message: Message) -> None:
+            if message.chat.type == "private":
+                await message.answer(f"Твой Telegram ID: <code>{message.from_user.id}</code>", parse_mode="HTML")
+
+        @dp.message(Command("allowgroup", "denygroup", "allowuser", "denyuser", "access"))
+        async def on_access_command(message: Message) -> None:
+            """Управление доступом — только владелец и только в личке."""
+            if message.chat.type != "private" or not message.from_user or message.from_user.id != owner_id:
+                return
+            command, *args = (message.text or "").split()
+            command = command.split("@")[0].lstrip("/")
+            if command == "access":
+                groups = ", ".join(map(str, access.list_allowed("group"))) or "нет"
+                users = ", ".join(map(str, access.list_allowed("user"))) or "нет"
+                await message.answer(f"🔐 Разрешённые группы:\n{groups}\n\n👤 Личный доступ:\n{users}")
+                return
+            if len(args) != 1:
+                await message.answer(f"Использование: /{command} ID")
+                return
+            try:
+                target_id = int(args[0])
+            except ValueError:
+                await message.answer("ID должен быть целым числом")
+                return
+            kind = "group" if command.endswith("group") else "user"
+            if kind == "user" and target_id <= 0:
+                await message.answer("User ID должен быть положительным")
+                return
+            if kind == "group" and target_id >= 0:
+                await message.answer("ID группы должен быть отрицательным")
+                return
+            enabled = command.startswith("allow")
+            try:
+                access.set_allowed(kind, target_id, enabled)
+            except ValueError as exc:
+                await message.answer(str(exc))
+                return
+            label = "группа" if kind == "group" else "пользователь"
+            await message.answer(f"{'✅ Разрешено' if enabled else '⛔ Запрещено'}: {label} {target_id}")
+            if kind == "group" and not enabled:
+                try:
+                    await bot.leave_chat(target_id)
+                except Exception:
+                    log.info("Бот не смог выйти из группы %s (возможно, уже вышел)", target_id)
 
         @dp.message(Command("start", "help"))
         async def on_start(message: Message) -> None:
@@ -217,11 +388,23 @@ async def main() -> None:
                 rules = rules_path.read_text(encoding="utf-8").strip()
             except OSError:
                 log.exception("Не удалось прочитать файл правил: %s", rules_path)
-                await message.answer("⚠️ Файл правил недоступен.")
+                await message.answer("⚠️ Файл правил недоступен. Сообщите администратору.")
                 return
             if not rules:
                 await message.answer("⚠️ Правила пока не заполнены.")
                 return
+
+            # Подставляем только разрешённые переменные, не раскрывая секреты из .env.
+            variables = {
+                "DAILY_TARGET": str(daily_target),
+                "REPORT_TIMEZONE": tz.key,
+                "PENALTY_TARGET": str(daily_target * 2 + 10),
+            }
+            rules = re.sub(
+                r"\{(DAILY_TARGET|REPORT_TIMEZONE|PENALTY_TARGET)\}",
+                lambda match: variables[match.group(1)],
+                rules,
+            )
             # Без parse_mode: текст файла выводится как есть, без проблем с HTML.
             # Telegram ограничивает размер сообщения 4096 символами.
             for start in range(0, len(rules), 4000):

@@ -1,3 +1,4 @@
+"""PushUp Tracker: Telegram-бот, отчёты, безопасный ручной ввод и диагностика."""
 from __future__ import annotations
 
 import asyncio
@@ -5,6 +6,8 @@ import html
 import logging
 import os
 import re
+import sqlite3
+import sys
 import tempfile
 import time
 from datetime import date, datetime, timedelta, timezone
@@ -13,45 +16,35 @@ from zoneinfo import ZoneInfo
 
 from aiogram import BaseMiddleware, Bot, Dispatcher, F
 from aiogram.filters import Command
-from aiogram.types import ChatMemberUpdated, ForceReply, Message
+from aiogram.types import BotCommand, ChatMemberUpdated, ForceReply, Message
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from dotenv import load_dotenv
 
 from storage import Storage
+from tracker_core import (
+    MANUAL_INPUT_TTL, MAX_MANUAL_COUNT, create_pending_manual, daily_report_rows,
+    help_text, owner_private, penalty_target, process_manual_reply, report_text,
+    setup_manual_storage, today_text,
+)
 from vision import analyze_video
 
 log = logging.getLogger(__name__)
 MAX_DOWNLOAD_BYTES = 20 * 1024 * 1024
-MAX_MANUAL_COUNT = 1000
 MAX_DAILY_OVERRIDE = 100_000
 DEBUG_GEMINI_MODEL = "gemini-3.5-flash-lite"
-
-
-def setup_manual_storage(db: Storage) -> None:
-    """Дополнить исходную схему SQLite, не изменяя storage.py."""
-    columns = {row[1] for row in db.conn.execute("PRAGMA table_info(video_counts)")}
-    with db.conn:
-        if "is_manual" not in columns:
-            db.conn.execute(
-                "ALTER TABLE video_counts ADD COLUMN is_manual INTEGER NOT NULL DEFAULT 0"
-            )
-        db.conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS pending_manual (
-                chat_id INTEGER NOT NULL,
-                video_message_id INTEGER NOT NULL,
-                user_id INTEGER NOT NULL,
-                display_name TEXT NOT NULL,
-                sent_at_utc TEXT NOT NULL,
-                prompt_message_id INTEGER,
-                PRIMARY KEY (chat_id, video_message_id)
-            )
-            """
-        )
+PUBLIC_COMMANDS = [
+    BotCommand(command="start", description="Начать работу"),
+    BotCommand(command="help", description="Все команды"),
+    BotCommand(command="stats", description="Отжимания сегодня"),
+    BotCommand(command="today", description="Отжимания сегодня"),
+    BotCommand(command="yesterday", description="Итоги вчера"),
+    BotCommand(command="rules", description="Правила"),
+    BotCommand(command="pravila", description="Правила"),
+    BotCommand(command="myid", description="Мой Telegram ID (личка)"),
+]
 
 
 def parse_id_list(raw: str, label: str) -> set[int]:
-    """Разобрать список ID из .env, не допуская ошибочную конфигурацию."""
     result = set()
     for item in raw.split(","):
         item = item.strip()
@@ -83,7 +76,6 @@ class AccessControl:
             )
 
     def allowed(self, kind: str, target_id: int) -> bool:
-        # Решение владельца из БД имеет приоритет над начальными значениями .env.
         if kind == "user" and target_id == self.owner_id:
             return True
         row = self.db.conn.execute(
@@ -99,8 +91,8 @@ class AccessControl:
             raise ValueError("Нельзя запретить доступ владельцу")
         with self.db.conn:
             self.db.conn.execute(
-                """INSERT INTO access_rules(kind, target_id, enabled) VALUES(?, ?, ?)
-                   ON CONFLICT(kind, target_id) DO UPDATE SET enabled=excluded.enabled""",
+                """INSERT INTO access_rules(kind,target_id,enabled) VALUES(?,?,?)
+                   ON CONFLICT(kind,target_id) DO UPDATE SET enabled=excluded.enabled""",
                 (kind, target_id, int(enabled)),
             )
 
@@ -118,8 +110,6 @@ class AccessControl:
 
 
 class AccessMiddleware(BaseMiddleware):
-    """Проверять доступ ДО выполнения любых обработчиков сообщения."""
-
     def __init__(self, access: AccessControl) -> None:
         self.access = access
         self.leaving: set[int] = set()
@@ -128,7 +118,7 @@ class AccessMiddleware(BaseMiddleware):
         chat = event.chat
         if chat.type == "private":
             if not event.from_user or not self.access.allowed("user", event.from_user.id):
-                return None  # Посторонним в личке ничего не отвечаем.
+                return None
         elif chat.type in ("group", "supergroup"):
             if not self.access.allowed("group", chat.id):
                 if chat.id not in self.leaving:
@@ -146,87 +136,77 @@ class AccessMiddleware(BaseMiddleware):
         return await handler(event, data)
 
 
-def daily_report_rows(
-    db: Storage, chat_id: int, day: date, tz: ZoneInfo, daily_target: int = 100
-) -> list[tuple[str, int, int, int, int, bool]]:
-    """(имя, повторы, видео, ручные видео, цель, override).
-
-    Админская корректировка переопределяет итог дня, но не число кружочков.
-    Штрафные цели пересчитываются с учётом корректировок прошлых дней.
-    """
-    end_utc = datetime.combine(
-        day + timedelta(days=1), datetime.min.time(), tzinfo=tz
-    ).astimezone(timezone.utc).isoformat()
-    video_rows = db.conn.execute(
-        """
-        SELECT m.user_id, m.display_name, v.count, v.is_manual, v.sent_at_utc
-        FROM video_counts v
-        JOIN members m ON m.chat_id = v.chat_id AND m.user_id = v.user_id
-        WHERE v.chat_id = ? AND v.sent_at_utc < ?
-        ORDER BY m.display_name COLLATE NOCASE, m.user_id, v.sent_at_utc
-        """,
-        (chat_id, end_utc),
-    ).fetchall()
-
-    members: dict[int, dict] = {}
-    for user_id, name, count, manual, timestamp in video_rows:
-        video_day = datetime.fromisoformat(timestamp).astimezone(tz).date()
-        member = members.setdefault(user_id, {"name": name, "first": video_day, "days": {}})
-        member["first"] = min(member["first"], video_day)
-        totals = member["days"].setdefault(video_day, [0, 0, 0, False])
-        totals[0] += count
-        totals[1] += 1
-        totals[2] += manual
-
-    # Переопределение применяется ПОСЛЕ суммирования видео.
-    # Оно меняет дневной результат, а не количество записанных видео.
-    for user_id, name, override_day, override_count in db.daily_overrides_until(chat_id, day):
-        member = members.setdefault(
-            user_id, {"name": name, "first": override_day, "days": {}}
-        )
-        member["name"] = name
-        member["first"] = min(member["first"], override_day)
-        totals = member["days"].setdefault(override_day, [0, 0, 0, False])
-        totals[0] = override_count
-        totals[3] = True
-
-    result = []
-    for member in sorted(members.values(), key=lambda m: m["name"].casefold()):
-        current_day = member["first"]
-        goal = daily_target
-        while current_day < day:
-            done = member["days"].get(current_day, [0])[0]
-            goal = daily_target if done >= goal else daily_target * 2 + 10
-            current_day += timedelta(days=1)
-        reps, videos, manual, overridden = member["days"].get(day, [0, 0, 0, False])
-        result.append((member["name"], reps, videos, manual, goal, overridden))
-    return result
-
-
-def report_text(
-    day: date, rows: list[tuple[str, int, int, int, int, bool]], target: int = 100
+def debug_text(
+    db: Storage, tz: ZoneInfo, daily_target: int, owner_id: int,
+    access: AccessControl, scheduler: AsyncIOScheduler,
+    started_at: datetime, db_path: str,
 ) -> str:
+    """Диагностика только для владельца. Никаких ключей и токенов."""
+    now = datetime.now(timezone.utc)
+    deadline = now.isoformat()
+    counts = {
+        "groups": db.conn.execute("SELECT COUNT(*) FROM chats").fetchone()[0],
+        "members": db.conn.execute("SELECT COUNT(*) FROM members").fetchone()[0],
+        "videos": db.conn.execute("SELECT COUNT(*) FROM video_counts").fetchone()[0],
+        "manual": db.conn.execute("SELECT COUNT(*) FROM video_counts WHERE is_manual=1").fetchone()[0],
+        "overrides": db.conn.execute("SELECT COUNT(*) FROM daily_overrides").fetchone()[0],
+        "reports": db.conn.execute("SELECT COUNT(*) FROM reports").fetchone()[0],
+        "pending_active": db.conn.execute(
+            "SELECT COUNT(*) FROM pending_manual WHERE expires_at_utc>?", (deadline,)
+        ).fetchone()[0],
+        "pending_expired": db.conn.execute(
+            "SELECT COUNT(*) FROM pending_manual WHERE expires_at_utc<=? OR expires_at_utc IS NULL",
+            (deadline,),
+        ).fetchone()[0],
+    }
+    try:
+        integrity = db.conn.execute("PRAGMA quick_check(1)").fetchone()[0]
+    except sqlite3.DatabaseError:
+        integrity = "ERROR"
+    try:
+        db_size = Path(db_path).stat().st_size
+    except OSError:
+        db_size = 0
+    next_report = scheduler.get_job("daily_report")
+    next_run = next_report.next_run_time if next_report is not None else None
+    uptime = str(timedelta(seconds=int((now - started_at).total_seconds())))
     lines = [
-        f"🏋️ <b>Отжимания за {day:%d.%m.%Y}</b>",
-        f"🎯 Обычная норма: <b>{target}</b> отжиманий",
+        "🔎 <b>PushUp Tracker: /debug</b>",
+        f"🕒 Сейчас: {now.astimezone(tz):%Y-%m-%d %H:%M:%S %Z}",
+        f"⏱ Uptime: {uptime}",
+        f"🐍 Python: {html.escape(sys.version.split()[0])}",
+        f"🗄 SQLite: {sqlite3.sqlite_version} · quick_check: {html.escape(str(integrity))}",
+        f"💾 DB: {db_size / 1024 / 1024:.2f} MiB",
+        f"🌍 Часовой пояс: {html.escape(tz.key)}",
+        f"🎯 Норма: {daily_target}; штрафная: {penalty_target(daily_target)}",
+        f"⌛ Ручной ввод: {int(MANUAL_INPUT_TTL.total_seconds() / 60)} минут",
+        f"🤖 Gemini (группы): {html.escape(os.getenv('GEMINI_MODEL', DEBUG_GEMINI_MODEL))}",
+        f"🧪 Gemini (личка): {html.escape(DEBUG_GEMINI_MODEL)}",
+        f"🔑 Gemini API: {'настроен' if os.getenv('GEMINI_API_KEY') else 'не настроен'}",
+        f"📅 Следующий отчёт: {next_run.astimezone(tz):%Y-%m-%d %H:%M %Z}" if next_run else "📅 Следующий отчёт: не запланирован",
         "",
+        "📊 <b>База данных</b>",
+        f"Групп: {counts['groups']}; участников: {counts['members']}",
+        f"Обработанных кружочков: {counts['videos']} (вручную: {counts['manual']})",
+        f"Корректировок: {counts['overrides']}; отправленных отчётов: {counts['reports']}",
+        f"Ожидают ввода: {counts['pending_active']}; просрочены: {counts['pending_expired']}",
+        f"Разрешённых групп: {len(access.list_allowed('group'))}",
+        f"Пользователей с доступом к личке: {len(access.list_allowed('user'))}",
     ]
-    for name, count, videos, manual, goal, overridden in rows:
-        status = "✅" if count >= goal else "❌"
-        suffix = f" · ✍️ {manual} вручную" if manual else ""
-        if overridden:
-            suffix += " · 🛠️ скорректировано"
-        lines.append(f"{status} <b>{html.escape(name)}</b> — {count}/{goal} · 🎥 {videos}{suffix}")
-        if goal > target:
-            lines.append(f"   🔥 <b>СЕГОДНЯ ШТРАФНАЯ НОРМА: {goal}!</b>")
-        if count < goal:
-            lines.append(f"   🚨 <b>НА {day + timedelta(days=1):%d.%m} НАЗНАЧЕНА НОРМА ×2 + 10: {target * 3}!</b>")
-    if not rows:
-        lines.append("Пока нет зарегистрированных участников с кружочками или корректировками.")
-    if any(manual for _, _, _, manual, _, _ in rows):
-        lines += ["", "✍️ Результаты введены вручную — их можно перепроверить по видео."]
-    if any(overridden for _, _, _, _, _, overridden in rows):
-        lines += ["", "🛠️ Итог за день задан администратором (вместо суммы по видео)."]
+    last_report = db.conn.execute("SELECT MAX(sent_at_utc) FROM reports").fetchone()[0]
+    if last_report:
+        lines.append(f"Последний отправленный отчёт: {html.escape(last_report)}")
+    details = db.conn.execute(
+        """SELECT c.chat_id, c.title, COUNT(DISTINCT m.user_id)
+           FROM chats c LEFT JOIN members m ON m.chat_id=c.chat_id
+           GROUP BY c.chat_id, c.title ORDER BY c.chat_id LIMIT 10"""
+    ).fetchall()
+    if details:
+        lines += ["", "👥 <b>Группы (первые 10)</b>"]
+        lines.extend(
+            f"{html.escape(title[:35])} (<code>{chat_id}</code>): {participants} уч."
+            for chat_id, title, participants in details
+        )
     return "\n".join(lines)
 
 
@@ -240,7 +220,7 @@ async def main() -> None:
         daily_target = int(os.getenv("DAILY_TARGET", "100"))
         cash_fine = int(os.getenv("CASH_FINE", "500"))
     except ValueError as exc:
-        raise ValueError("DAILY_TARGET должен быть целым положительным числом") from exc
+        raise ValueError("DAILY_TARGET и CASH_FINE должны быть целыми числами") from exc
     if daily_target <= 0:
         raise ValueError("DAILY_TARGET должен быть больше нуля")
     try:
@@ -248,67 +228,61 @@ async def main() -> None:
     except ValueError as exc:
         raise ValueError("OWNER_ID должен быть числовым Telegram User ID") from exc
     if owner_id <= 0:
-        raise RuntimeError("Укажите OWNER_ID в .env: бот работает только с заданным владельцем")
-
-    db = Storage(os.getenv("DB_PATH", "./data/pushups.sqlite3"))
+        raise RuntimeError("Укажите OWNER_ID в .env")
+    db_path = os.getenv("DB_PATH", "./data/pushups.sqlite3")
+    db = Storage(db_path)
     setup_manual_storage(db)
     access = AccessControl(db, owner_id)
     dp = Dispatcher()
     dp.message.outer_middleware(AccessMiddleware(access))
     semaphore = asyncio.Semaphore(2)
     report_lock = asyncio.Lock()
-
-    # Текст правил хранится отдельно и перечитывается при каждом вызове команды.
+    started_at = datetime.now(timezone.utc)
     rules_path = Path(os.getenv("RULES_PATH", str(Path(__file__).with_name("rules.txt"))))
+    scheduler = AsyncIOScheduler(timezone=tz)
 
     def get_report(chat_id: int, day: date) -> str:
         return report_text(day, daily_report_rows(db, chat_id, day, tz, daily_target), daily_target)
 
     async with Bot(token=token) as bot:
         async def ask_manual(message: Message, reason: str) -> None:
-            """Сохранить запрос до отправки сообщения с просьбой о ручном вводе."""
             if not message.from_user or not message.video_note:
                 return
             chat_id, message_id = message.chat.id, message.message_id
             if db.has_video(chat_id, message_id):
                 return
-            existing = db.conn.execute(
+            if db.conn.execute(
                 "SELECT 1 FROM pending_manual WHERE chat_id=? AND video_message_id=?",
                 (chat_id, message_id),
-            ).fetchone()
-            if existing:
+            ).fetchone():
                 return
-            with db.conn:
-                db.conn.execute(
-                    """
-                    INSERT OR IGNORE INTO pending_manual
-                        (chat_id, video_message_id, user_id, display_name, sent_at_utc)
-                    VALUES (?, ?, ?, ?, ?)
-                    """,
-                    (
-                        chat_id, message_id, message.from_user.id,
-                        message.from_user.full_name,
-                        message.date.astimezone(timezone.utc).isoformat(),
-                    ),
-                )
+            inserted = create_pending_manual(
+                db, chat_id, message_id, message.from_user.id, message.from_user.full_name,
+                message.date,
+            )
+            if not inserted:
+                return
             try:
                 prompt = await message.reply(
-                    f"⚠️ {reason}\n"
+                    f"⚠️ {html.escape(reason)}\n"
                     f"✍️ {html.escape(message.from_user.full_name)}, укажи количество отжиманий "
                     f"числом от 0 до {MAX_MANUAL_COUNT} в ответ на это сообщение.\n"
-                    "Результат будет помечен как введённый вручную — его можно перепроверить по кружочку.",
+                    "⏳ На ввод есть 15 минут с момента запроса. "
+                    "Результат будет помечен как ручной — его можно перепроверить по кружочку.",
                     parse_mode="HTML",
                     reply_markup=ForceReply(input_field_placeholder="Например: 25", selective=True),
                 )
             except Exception:
+                with db.conn:
+                    db.conn.execute(
+                        "DELETE FROM pending_manual WHERE chat_id=? AND video_message_id=?",
+                        (chat_id, message_id),
+                    )
                 log.exception("Не удалось запросить ручной ввод chat=%s msg=%s", chat_id, message_id)
                 return
             with db.conn:
                 db.conn.execute(
-                    """
-                    UPDATE pending_manual SET prompt_message_id=?
-                    WHERE chat_id=? AND video_message_id=?
-                    """,
+                    "UPDATE pending_manual SET prompt_message_id=? WHERE chat_id=? AND video_message_id=?",
                     (prompt.message_id, chat_id, message_id),
                 )
 
@@ -330,32 +304,38 @@ async def main() -> None:
                     else:
                         db.mark_report_sent(chat_id, yesterday)
 
+        def purge_old_pending() -> None:
+            """Очищать только очень старые запросы, оставив время на ответ об истечении."""
+            threshold = (datetime.now(timezone.utc) - timedelta(days=1)).isoformat()
+            with db.conn:
+                db.conn.execute(
+                    "DELETE FROM pending_manual WHERE expires_at_utc<? OR expires_at_utc IS NULL",
+                    (threshold,),
+                )
+
         @dp.my_chat_member()
         async def on_bot_membership(event: ChatMemberUpdated) -> None:
-            """Сразу покинуть любую новую группу, которой нет в белом списке."""
             if event.chat.type not in ("group", "supergroup"):
                 return
             if event.new_chat_member.status not in ("member", "administrator"):
                 return
             if not access.allowed("group", event.chat.id):
-                log.warning(
-                    "Бот добавлен в чужую группу: %s (%s). Для разрешения: /allowgroup %s",
-                    event.chat.id, event.chat.title, event.chat.id,
-                )
+                log.warning("Бот добавлен в неразрешённую группу %s", event.chat.id)
                 try:
                     await bot.leave_chat(event.chat.id)
                 except Exception:
-                    log.exception("Не удалось выйти из неразрешённой группы %s", event.chat.id)
+                    log.exception("Не удалось выйти из группы %s", event.chat.id)
 
         @dp.message(Command("myid"))
         async def on_myid(message: Message) -> None:
-            if message.chat.type == "private":
-                await message.answer(f"Твой Telegram ID: <code>{message.from_user.id}</code>", parse_mode="HTML")
+            if message.chat.type == "private" and message.from_user:
+                await message.answer(
+                    f"Твой Telegram ID: <code>{message.from_user.id}</code>", parse_mode="HTML"
+                )
 
         @dp.message(Command("allowgroup", "denygroup", "allowuser", "denyuser", "access"))
         async def on_access_command(message: Message) -> None:
-            """Управление доступом — только владелец и только в личке."""
-            if message.chat.type != "private" or not message.from_user or message.from_user.id != owner_id:
+            if not owner_private(message.chat.type, message.from_user.id if message.from_user else None, owner_id):
                 return
             command, *args = (message.text or "").split()
             command = command.split("@")[0].lstrip("/")
@@ -386,30 +366,34 @@ async def main() -> None:
                 await message.answer(str(exc))
                 return
             label = "группа" if kind == "group" else "пользователь"
-            await message.answer(f"{'✅ Разрешено' if enabled else '⛔ Запрещено'}: {label} {target_id}")
+            await message.answer(
+                f"{'✅ Разрешено' if enabled else '⛔ Запрещено'}: {label} {target_id}"
+            )
             if kind == "group" and not enabled:
                 try:
                     await bot.leave_chat(target_id)
                 except Exception:
                     log.info("Бот не смог выйти из группы %s (возможно, уже вышел)", target_id)
 
-        @dp.message(Command("start", "help"))
+        @dp.message(Command("start"))
         async def on_start(message: Message) -> None:
             if message.chat.type in ("group", "supergroup"):
                 db.register_chat(message.chat.id, message.chat.title or "Группа")
             await message.answer(
-                "🏋️ Пришлите видеокружочек с отжиманиями. Я посчитаю повторы и отмечу выполнение дневной нормы.\n"
-                "Если видео не распознаётся, попрошу автора написать число вручную. "
-                "Такие результаты помечаются ✍️ и их можно проверить.\n"
-                "Команды: /stats — сегодня, /yesterday — вчера, /rules — правила. "
-                f"Дневная норма: {daily_target}. Отчёт — в 00:00 ({tz.key})."
-                + ("\nВладелец: /setpushups, /clearpushups — ручная корректировка итогов за день."
-                   if message.from_user and message.from_user.id == owner_id else "")
+                "🏋️ Пришлите видеокружочек с отжиманиями. Я посчитаю повторы.\n"
+                "Если видео не распознаётся, можно указать число вручную в течение 15 минут.\n"
+                f"Дневная норма: {daily_target}. Отчёт — в 00:00 ({tz.key}).\n"
+                "Список команд: /help"
             )
+
+        @dp.message(Command("help"))
+        async def on_help(message: Message) -> None:
+            if message.chat.type in ("group", "supergroup"):
+                db.register_chat(message.chat.id, message.chat.title or "Группа")
+            await message.answer(help_text(), parse_mode="HTML")
 
         @dp.message(Command("rules", "pravila"))
         async def on_rules(message: Message) -> None:
-            """Показать правила челленджа из отдельного текстового файла."""
             try:
                 rules = rules_path.read_text(encoding="utf-8").strip()
             except OSError:
@@ -419,45 +403,40 @@ async def main() -> None:
             if not rules:
                 await message.answer("⚠️ Правила пока не заполнены.")
                 return
-
-            # Подставляем только разрешённые переменные, не раскрывая секреты из .env.
             variables = {
                 "DAILY_TARGET": str(daily_target),
                 "REPORT_TIMEZONE": tz.key,
-                "PENALTY_TARGET": str(daily_target * 2 + 10),
+                "PENALTY_TARGET": str(penalty_target(daily_target)),
                 "CASH_FINE": str(cash_fine),
             }
             rules = re.sub(
                 r"\{(DAILY_TARGET|REPORT_TIMEZONE|PENALTY_TARGET|CASH_FINE)\}",
-                lambda match: variables[match.group(1)],
-                rules,
+                lambda match: variables[match.group(1)], rules,
             )
-            # Без parse_mode: текст файла выводится как есть, без проблем с HTML.
-            # Telegram ограничивает размер сообщения 4096 символами.
-            for start in range(0, len(rules), 4000):
-                await message.answer(rules[start:start + 4000], parse_mode=None)
+            for offset in range(0, len(rules), 4000):
+                await message.answer(rules[offset:offset + 4000], parse_mode=None)
 
-        @dp.message(Command("stats", "yesterday"))
-        async def on_stats(message: Message) -> None:
+        @dp.message(Command("stats", "today"))
+        async def on_today(message: Message) -> None:
             day = datetime.now(tz).date()
-            if message.text and message.text.split()[0].split("@")[0] == "/yesterday":
-                day -= timedelta(days=1)
+            rows = daily_report_rows(db, message.chat.id, day, tz, daily_target)
+            await message.answer(today_text(day, rows), parse_mode="HTML")
+
+        @dp.message(Command("yesterday"))
+        async def on_yesterday(message: Message) -> None:
+            day = datetime.now(tz).date() - timedelta(days=1)
             await message.answer(get_report(message.chat.id, day), parse_mode="HTML")
+
+        @dp.message(Command("debug"))
+        async def on_debug(message: Message) -> None:
+            if not owner_private(message.chat.type, message.from_user.id if message.from_user else None, owner_id):
+                return
+            text = debug_text(db, tz, daily_target, owner_id, access, scheduler, started_at, db_path)
+            await message.answer(text, parse_mode="HTML")
 
         @dp.message(Command("setpushups", "clearpushups"))
         async def on_override_pushups(message: Message) -> None:
-            """Владелец задаёт/снимает итог дня для одного участника.
-
-            Ответ на сообщение участника в группе:
-                /setpushups COUNT [YYYY-MM-DD]
-                /clearpushups [YYYY-MM-DD]
-            В группе по ID:
-                /setpushups USER_ID COUNT [YYYY-MM-DD]
-                /clearpushups USER_ID [YYYY-MM-DD]
-            В личке владельца:
-                /setpushups CHAT_ID USER_ID COUNT [YYYY-MM-DD]
-                /clearpushups CHAT_ID USER_ID [YYYY-MM-DD]
-            """
+            """Владелец задаёт/удаляет дневную корректировку (как и раньше)."""
             if not message.from_user or message.from_user.id != owner_id:
                 await message.reply("🔒 Команда доступна только владельцу бота.")
                 return
@@ -473,7 +452,6 @@ async def main() -> None:
                 except ValueError:
                     await message.reply("❌ Неверная дата, нужен формат YYYY-MM-DD.")
                     return
-
             is_private = message.chat.type == "private"
             reply_user = (
                 message.reply_to_message.from_user
@@ -501,12 +479,11 @@ async def main() -> None:
                         raise ValueError("Неверное число аргументов")
                     chat_id, user_id = message.chat.id, int(args[0])
                     raw_count = args[1] if setting else None
-
                 if chat_id >= 0 or user_id <= 0:
                     raise ValueError("ID группы должен быть отрицательным, ID участника — положительным")
                 count = None
                 if setting:
-                    if raw_count is None or not re.fullmatch(r"[0-9]+", raw_count):
+                    if raw_count is None or not re.fullmatch(r"[0-9]{1,6}", raw_count):
                         raise ValueError("Количество должно быть целым неотрицательным числом")
                     count = int(raw_count)
                     if count > MAX_DAILY_OVERRIDE:
@@ -526,16 +503,13 @@ async def main() -> None:
                     parse_mode="HTML",
                 )
                 return
-
             if not is_private:
                 db.register_chat(chat_id, message.chat.title or "Группа")
             elif chat_id not in db.chat_ids():
                 await message.reply("❌ Группа не зарегистрирована в базе бота.")
                 return
-
             display_name = reply_user.full_name if reply_user else db.member_name(chat_id, user_id)
             if display_name is None:
-                # Не записываем произвольные ID, которых нет среди участников.
                 try:
                     member = await bot.get_chat_member(chat_id, user_id)
                     if getattr(member.status, "value", member.status) in ("left", "kicked"):
@@ -547,11 +521,8 @@ async def main() -> None:
                         "Ответь командой на его сообщение в группе или укажи известный ID участника."
                     )
                     return
-
             if setting:
-                db.set_daily_override(
-                    chat_id, user_id, display_name, chosen_day, count, message.from_user.id
-                )
+                db.set_daily_override(chat_id, user_id, display_name, chosen_day, count, message.from_user.id)
                 action_text = f"🛠️ Установлено <b>{count}</b> отжиманий"
             else:
                 deleted = db.clear_daily_override(chat_id, user_id, chosen_day)
@@ -559,7 +530,6 @@ async def main() -> None:
                     await message.reply("ℹ️ На указанную дату корректировка отсутствует.")
                     return
                 action_text = "✅ Корректировка удалена, снова учитываются видео"
-
             current = db.daily_user_total(chat_id, user_id, chosen_day, tz)
             detail = f"\n📊 Сейчас за день: <b>{current}</b>" if current is not None else ""
             log.info(
@@ -567,10 +537,8 @@ async def main() -> None:
                 command, chat_id, user_id, chosen_day, count, message.from_user.id,
             )
             await message.reply(
-                f"{action_text}\n"
-                f"👤 {html.escape(display_name)}\n"
-                f"📅 {chosen_day:%d.%m.%Y}\n"
-                f"{detail}\n"
+                f"{action_text}\n👤 {html.escape(display_name)}\n"
+                f"📅 {chosen_day:%d.%m.%Y}{detail}\n"
                 "ℹ️ Изменение учтётся в /stats и /yesterday.",
                 parse_mode="HTML",
             )
@@ -579,84 +547,52 @@ async def main() -> None:
         async def on_manual_reply(message: Message) -> None:
             if not message.from_user or message.from_user.is_bot or not message.reply_to_message:
                 return
-            replied_id = message.reply_to_message.message_id
-            pending = db.conn.execute(
-                """
-                SELECT video_message_id, user_id, display_name, sent_at_utc
-                FROM pending_manual
-                WHERE chat_id=? AND (prompt_message_id=? OR video_message_id=?)
-                """,
-                (message.chat.id, replied_id, replied_id),
-            ).fetchone()
-            if pending is None:
-                return
-            original_id, user_id, name, sent_at_utc = pending
-            if message.from_user.id != user_id:
-                await message.reply("🔒 Количество может указать только автор кружочка.")
-                return
-            value = (message.text or "").strip()
-            if not value.isascii() or not value.isdecimal() or len(value) > 4 or int(value) > MAX_MANUAL_COUNT:
-                await message.reply(f"Напиши только число от 0 до {MAX_MANUAL_COUNT} в ответ на запрос бота.")
-                return
-            count = int(value)
-            # Между сохранением результата и удалением ожидающего запроса нет await, чтобы избежать дублей.
-            inserted = db.save_video(
-                message.chat.id, original_id, user_id, name,
-                count, datetime.fromisoformat(sent_at_utc),
+            result = process_manual_reply(
+                db, message.chat.id, message.reply_to_message.message_id,
+                message.from_user.id, message.text,
             )
-            with db.conn:
-                if inserted:
-                    db.conn.execute(
-                        """
-                        UPDATE video_counts SET is_manual=1
-                        WHERE chat_id=? AND message_id=?
-                        """,
-                        (message.chat.id, original_id),
-                    )
-                db.conn.execute(
-                    "DELETE FROM pending_manual WHERE chat_id=? AND video_message_id=?",
-                    (message.chat.id, original_id),
-                )
-            if inserted:
+            if result.status == "not_found":
+                return
+            if result.status == "forbidden":
+                await message.reply("🔒 Количество может указать только автор кружочка.")
+            elif result.status == "expired":
+                await message.reply("⌛ Время ручного ввода истекло (15 минут). Отправь новый кружочек.")
+            elif result.status == "invalid":
                 await message.reply(
-                    f"✍️ <b>{html.escape(name)}</b>: <b>{count}</b> отжиманий — "
+                    f"Напиши только число от 0 до {MAX_MANUAL_COUNT} в ответ на запрос бота."
+                )
+            elif result.status == "accepted":
+                await message.reply(
+                    f"✍️ <b>{html.escape(result.name)}</b>: <b>{result.count}</b> отжиманий — "
                     "указано вручную, можно перепроверить по видео.",
                     parse_mode="HTML",
                 )
 
         @dp.message(F.video_note)
         async def on_video_note(message: Message) -> None:
-            # В личном чате анализируем кружочек отдельно от статистики группы.
-            # Ни запись в SQLite, ни запрос ручного ввода в debug-режиме не создаются.
             if message.chat.type == "private":
+                # Диагностика видео в личке: не сохраняет статистику и не просит ручной ввод.
                 note = message.video_note
                 details = [
                     "🔎 <b>Gemini: диагностика видео</b>",
                     f"🧠 Модель отладки: <code>{DEBUG_GEMINI_MODEL}</code>",
                     f"🎬 Длительность видео: {note.duration} с",
-                    (
-                        f"💾 Размер: {note.file_size / (1024 * 1024):.2f} МБ"
-                        if note.file_size is not None else "💾 Размер: неизвестен"
-                    ),
+                    (f"💾 Размер: {note.file_size / (1024 * 1024):.2f} МБ"
+                     if note.file_size is not None else "💾 Размер: неизвестен"),
                     f"📦 Локальный лимит файла: {MAX_DOWNLOAD_BYTES / (1024 * 1024):.0f} МБ",
                     "🌐 Таймаут скачивания: 90 с",
                     "🧵 Одновременно анализируется до 2 видео",
                 ]
                 if note.file_size and note.file_size > MAX_DOWNLOAD_BYTES:
-                    details.append("❌ Файл превышает локальный лимит — анализ не выполнялся.")
-                    details.append("🧪 Результат не записан в статистику.")
+                    details += ["❌ Файл превышает локальный лимит — анализ не выполнялся.",
+                                "🧪 Результат не записан в статистику."]
                     await message.answer("\n".join(details), parse_mode="HTML")
                     return
-
                 started = time.perf_counter()
-                queue_seconds = None
-                download_seconds = None
-                analysis_seconds = None
+                queue_seconds = download_seconds = analysis_seconds = None
                 phase = "ожидание свободного слота"
-                analysis = None
-                error = None
+                analysis = error = None
                 try:
-                    # Общий semaphore такой же, как в группах.
                     async with semaphore:
                         queue_seconds = time.perf_counter() - started
                         with tempfile.TemporaryDirectory(prefix="pushup-debug-") as tempdir:
@@ -667,24 +603,19 @@ async def main() -> None:
                                 await bot.download(note.file_id, destination=target, timeout=90)
                             finally:
                                 download_seconds = time.perf_counter() - download_started
-
                             phase = "анализ Gemini"
                             analysis_started = time.perf_counter()
                             try:
                                 analysis = await asyncio.to_thread(
                                     analyze_video, target, duration_seconds=note.duration,
-                                    model_override=DEBUG_GEMINI_MODEL
+                                    model_override=DEBUG_GEMINI_MODEL,
                                 )
                             finally:
                                 analysis_seconds = time.perf_counter() - analysis_started
                 except Exception as exc:
                     error = exc
-                    log.exception(
-                        "Ошибка debug-анализа кружочка user=%s phase=%s",
-                        message.from_user.id if message.from_user else "unknown",
-                        phase,
-                    )
-
+                    log.exception("Ошибка debug-анализа кружочка user=%s phase=%s",
+                                  message.from_user.id if message.from_user else "unknown", phase)
                 details.append("\n⏱ <b>Замеры времени</b>")
                 if queue_seconds is not None:
                     details.append(f"⏳ Ожидание слота: {queue_seconds:.2f} с")
@@ -693,40 +624,30 @@ async def main() -> None:
                 if analysis_seconds is not None:
                     details.append(f"🤖 Анализ Gemini: {analysis_seconds:.2f} с")
                 details.append(f"🕒 Всего: {time.perf_counter() - started:.2f} с")
-
                 if error is not None:
-                    details.append(
-                        f"❌ Ошибка на этапе «{phase}» ({type(error).__name__}). "
-                        "Подробности — в логах."
-                    )
+                    details.append(f"❌ Ошибка на этапе «{phase}» ({type(error).__name__}). Подробности — в логах.")
                 elif analysis is None:
                     details.append("⚠️ Анализатор не вернул надёжный результат.")
                 else:
                     details.append("\n💪 <b>Результат</b>")
                     details.append(f"Отжиманий: <b>{analysis.repetitions}</b>")
+                    details.append(f"Неопределённость: {'⚠️ да' if analysis.uncertain else '✅ нет'}")
+                    timestamps = analysis.completed_at_seconds
                     details.append(
-                        f"Неопределённость: {'⚠️ да' if analysis.uncertain else '✅ нет'}"
-                    )
-                    details.append(
-                        "Моменты завершения: "
-                        + (
-                            ", ".join(f"{timestamp:g} с" for timestamp in analysis.completed_at_seconds)
-                            if analysis.completed_at_seconds
-                            else "нет"
+                        "Моменты завершения: " + (
+                            ", ".join(f"{timestamp:g} с" for timestamp in timestamps[:100])
+                            + (f" …и ещё {len(timestamps) - 100}" if len(timestamps) > 100 else "")
+                            if timestamps else "нет"
                         )
                     )
                     if analysis.requested_fps is not None:
-                        details.append(
-                            f"🎞 Заданная частота выборки видео: {analysis.requested_fps} FPS"
-                        )
+                        details.append(f"🎞 Заданная частота выборки видео: {analysis.requested_fps} FPS")
                     if analysis.api_seconds is not None:
                         details.append(f"⚙️ Вызов Gemini API: {analysis.api_seconds:.2f} с")
                     details.append(
                         "⚠️ Gemini сообщил о неопределённости: результат не подтверждён."
-                        if analysis.uncertain
-                        else "✅ Ответ анализатора получен."
+                        if analysis.uncertain else "✅ Ответ анализатора получен."
                     )
-
                     details.append("\n🔢 <b>Использование токенов</b>")
                     usage = analysis.usage_metadata
                     token_fields = (
@@ -743,18 +664,13 @@ async def main() -> None:
                                 details.append(f"{label}: {value:,}".replace(",", " "))
                     else:
                         details.append("Метаданные токенов не предоставлены Gemini API.")
-
                     if analysis.model:
                         details.append(f"🧠 Модель: {html.escape(analysis.model)}")
                     if analysis.finish_reason:
-                        details.append(
-                            f"🛑 Причина завершения: {html.escape(analysis.finish_reason)}"
-                        )
-
+                        details.append(f"🛑 Причина завершения: {html.escape(analysis.finish_reason)}")
                 details.append("🧪 Тестовый режим: результат не записан в статистику.")
                 await message.answer("\n".join(details), parse_mode="HTML")
                 return
-
             if message.chat.type not in ("group", "supergroup"):
                 return
             if not message.from_user or message.from_user.is_bot:
@@ -766,24 +682,21 @@ async def main() -> None:
             if note.file_size and note.file_size > MAX_DOWNLOAD_BYTES:
                 await ask_manual(message, "Кружочек превышает лимит скачивания (20 МБ).")
                 return
-
             try:
                 async with semaphore:
                     with tempfile.TemporaryDirectory(prefix="pushup-") as tempdir:
                         target = Path(tempdir) / "note.mp4"
                         await bot.download(note.file_id, destination=target, timeout=90)
                         analysis = await asyncio.to_thread(
-                            analyze_video, target, duration_seconds=note.duration
+                            analyze_video, target, duration_seconds=note.duration,
                         )
             except Exception:
                 log.exception("Ошибка анализа кружочка chat=%s msg=%s", message.chat.id, message.message_id)
                 await ask_manual(message, "Не удалось обработать этот кружочек автоматически.")
                 return
-
             if analysis is None or analysis.uncertain:
                 await ask_manual(message, "Не удалось уверенно распознать отжимания.")
                 return
-
             name = message.from_user.full_name
             inserted = db.save_video(
                 message.chat.id, message.message_id, message.from_user.id,
@@ -795,13 +708,18 @@ async def main() -> None:
                     parse_mode="HTML",
                 )
 
-        scheduler = AsyncIOScheduler(timezone=tz)
         scheduler.add_job(
             publish_yesterday, "cron", hour=0, minute=0,
             id="daily_report", max_instances=1, coalesce=True,
         )
+        scheduler.add_job(purge_old_pending, "interval", hours=1,
+                          id="clean_manual_pending", max_instances=1, coalesce=True)
         scheduler.start()
         try:
+            try:
+                await bot.set_my_commands(PUBLIC_COMMANDS)
+            except Exception:
+                log.exception("Не удалось обновить список команд Telegram")
             await bot.delete_webhook(drop_pending_updates=False)
             await publish_yesterday()
             await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())

@@ -11,7 +11,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 WORKDIR /app
 COPY requirements.txt ./
 RUN pip install --no-cache-dir -r requirements.txt
-COPY bot.py storage.py vision.py ./
+COPY bot.py tracker_core.py storage.py vision.py ./
 COPY rules.txt ./
 RUN mkdir -p /data
 CMD ["python", "bot.py"]

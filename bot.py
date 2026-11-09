@@ -22,8 +22,9 @@ from dotenv import load_dotenv
 
 from storage import Storage
 from tracker_core import (
-    MANUAL_INPUT_TTL, MAX_MANUAL_COUNT, create_pending_manual, daily_report_rows,
-    help_text, owner_private, penalty_target, process_manual_reply, report_text,
+    MANUAL_INPUT_TTL, MAX_MANUAL_COUNT, MANUAL_REVIEW_THRESHOLD,
+    MAX_INVALID_MANUAL_ATTEMPTS, MAX_MANUAL_VIDEOS_PER_DAY, create_pending_manual, daily_report_rows,
+    help_text, manual_input_error_message, owner_private, penalty_target, process_manual_reply, report_text,
     setup_manual_storage, today_text,
 )
 from vision import analyze_video
@@ -154,6 +155,18 @@ def debug_text(
         "pending_active": db.conn.execute(
             "SELECT COUNT(*) FROM pending_manual WHERE expires_at_utc>?", (deadline,)
         ).fetchone()[0],
+        "pending_locked": db.conn.execute(
+            "SELECT COUNT(*) FROM pending_manual WHERE invalid_attempts>=? AND expires_at_utc>?",
+            (MAX_INVALID_MANUAL_ATTEMPTS, deadline),
+        ).fetchone()[0],
+        "high_manual_24h": db.conn.execute(
+            "SELECT COUNT(*) FROM video_counts WHERE is_manual=1 AND count>=? AND sent_at_utc>=?",
+            (MANUAL_REVIEW_THRESHOLD, (now - timedelta(hours=24)).isoformat()),
+        ).fetchone()[0],
+        "suspicious_24h": db.conn.execute(
+            "SELECT COUNT(*) FROM manual_rejections WHERE created_at_utc>=?",
+            ((now - timedelta(hours=24)).isoformat(),),
+        ).fetchone()[0],
         "pending_expired": db.conn.execute(
             "SELECT COUNT(*) FROM pending_manual WHERE expires_at_utc<=? OR expires_at_utc IS NULL",
             (deadline,),
@@ -179,7 +192,10 @@ def debug_text(
         f"💾 DB: {db_size / 1024 / 1024:.2f} MiB",
         f"🌍 Часовой пояс: {html.escape(tz.key)}",
         f"🎯 Норма: {daily_target}; штрафная: {penalty_target(daily_target)}",
-        f"⌛ Ручной ввод: {int(MANUAL_INPUT_TTL.total_seconds() / 60)} минут",
+        f"⌛ Ручной ввод: 0–{MAX_MANUAL_COUNT}, "
+        f"до {MAX_MANUAL_VIDEOS_PER_DAY} кружочков/сутки, "
+        f"{MAX_INVALID_MANUAL_ATTEMPTS} ошибки до блокировки, "
+        f"{int(MANUAL_INPUT_TTL.total_seconds() / 60)} минут",
         f"🤖 Gemini (группы): {html.escape(os.getenv('GEMINI_MODEL', DEBUG_GEMINI_MODEL))}",
         f"🧪 Gemini (личка): {html.escape(DEBUG_GEMINI_MODEL)}",
         f"🔑 Gemini API: {'настроен' if os.getenv('GEMINI_API_KEY') else 'не настроен'}",
@@ -189,10 +205,37 @@ def debug_text(
         f"Групп: {counts['groups']}; участников: {counts['members']}",
         f"Обработанных кружочков: {counts['videos']} (вручную: {counts['manual']})",
         f"Корректировок: {counts['overrides']}; отправленных отчётов: {counts['reports']}",
-        f"Ожидают ввода: {counts['pending_active']}; просрочены: {counts['pending_expired']}",
+        f"Ожидают ввода: {counts['pending_active']}; блокированы: {counts['pending_locked']}; "
+        f"просрочены: {counts['pending_expired']}",
+        f"🚩 Попыток ввода числа >{MAX_MANUAL_COUNT} за 24 ч: {counts['suspicious_24h']}",
+        f"🔎 Ручных результатов от {MANUAL_REVIEW_THRESHOLD} за 24 ч: {counts['high_manual_24h']}",
         f"Разрешённых групп: {len(access.list_allowed('group'))}",
         f"Пользователей с доступом к личке: {len(access.list_allowed('user'))}",
     ]
+    recent_rejections = db.conn.execute(
+        """SELECT chat_id, user_id, rejected_count, created_at_utc
+           FROM manual_rejections ORDER BY id DESC LIMIT 5"""
+    ).fetchall()
+    if recent_rejections:
+        lines += ["", "🚩 <b>Последние отклонённые ручные числа</b>"]
+        lines.extend(
+            f"Группа <code>{chat_id}</code>; user <code>{user_id}</code>; "
+            f"запрос {rejected}; {html.escape(when[:19])} UTC"
+            for chat_id, user_id, rejected, when in recent_rejections
+        )
+    high_manual = db.conn.execute(
+        """SELECT chat_id, user_id, count, sent_at_utc FROM video_counts
+           WHERE is_manual=1 AND count>=?
+           ORDER BY sent_at_utc DESC LIMIT 5""",
+        (MANUAL_REVIEW_THRESHOLD,),
+    ).fetchall()
+    if high_manual:
+        lines += ["", "🔎 <b>Последние высокие ручные результаты</b>"]
+        lines.extend(
+            f"Группа <code>{chat_id}</code>; user <code>{user_id}</code>; "
+            f"{count} повторов; {html.escape(when[:19])} UTC"
+            for chat_id, user_id, count, when in high_manual
+        )
     last_report = db.conn.execute("SELECT MAX(sent_at_utc) FROM reports").fetchone()[0]
     if last_report:
         lines.append(f"Последний отправленный отчёт: {html.escape(last_report)}")
@@ -266,7 +309,9 @@ async def main() -> None:
                 prompt = await message.reply(
                     f"⚠️ {html.escape(reason)}\n"
                     f"✍️ {html.escape(message.from_user.full_name)}, укажи количество отжиманий "
-                    f"числом от 0 до {MAX_MANUAL_COUNT} в ответ на это сообщение.\n"
+                    "целым неотрицательным числом в ответ на это сообщение.\n"
+                    f"Лимит: {MAX_MANUAL_VIDEOS_PER_DAY} ручных кружочка в сутки, "
+                    f"{MAX_INVALID_MANUAL_ATTEMPTS} попытки на ввод.\n"
                     "⏳ На ввод есть 15 минут с момента запроса. "
                     "Результат будет помечен как ручной — его можно перепроверить по кружочку.",
                     parse_mode="HTML",
@@ -305,12 +350,18 @@ async def main() -> None:
                         db.mark_report_sent(chat_id, yesterday)
 
         def purge_old_pending() -> None:
-            """Очищать только очень старые запросы, оставив время на ответ об истечении."""
-            threshold = (datetime.now(timezone.utc) - timedelta(days=1)).isoformat()
+            """Очищать просроченные запросы и 90-дневные записи об отклонениях."""
+            now = datetime.now(timezone.utc)
+            threshold = (now - timedelta(days=1)).isoformat()
+            history_threshold = (now - timedelta(days=90)).isoformat()
             with db.conn:
                 db.conn.execute(
                     "DELETE FROM pending_manual WHERE expires_at_utc<? OR expires_at_utc IS NULL",
                     (threshold,),
+                )
+                db.conn.execute(
+                    "DELETE FROM manual_rejections WHERE created_at_utc<?",
+                    (history_threshold,),
                 )
 
         @dp.my_chat_member()
@@ -381,7 +432,8 @@ async def main() -> None:
                 db.register_chat(message.chat.id, message.chat.title or "Группа")
             await message.answer(
                 "🏋️ Пришлите видеокружочек с отжиманиями. Я посчитаю повторы.\n"
-                "Если видео не распознаётся, можно указать число вручную в течение 15 минут.\n"
+                "Если видео не распознаётся, можно указать число отжиманий вручную "
+                "(15 минут на ввод, до 3 кружочков в сутки).\n"
                 f"Дневная норма: {daily_target}. Отчёт — в 00:00 ({tz.key}).\n"
                 "Список команд: /help"
             )
@@ -549,17 +601,48 @@ async def main() -> None:
                 return
             result = process_manual_reply(
                 db, message.chat.id, message.reply_to_message.message_id,
-                message.from_user.id, message.text,
+                message.from_user.id, message.text, report_tz=tz,
             )
+            if result.notify_owner:
+                if result.status == "accepted":
+                    owner_notice = (
+                        f"🔎 Высокий ручной результат: user {message.from_user.id}, "
+                        f"чат {message.chat.id}, ответ на сообщение {message.reply_to_message.message_id}: "
+                        f"{result.count} повторов. Результат засчитан, но рекомендуется "
+                        "проверить исходное видео (/debug показывает последние такие записи)."
+                    )
+                else:
+                    owner_notice = (
+                        f"🚩 Превышение лимита ручного ввода: user {message.from_user.id}, "
+                        f"чат {message.chat.id}, запрос {message.reply_to_message.message_id}: "
+                        f"{result.count} повторов. Максимум — {MAX_MANUAL_COUNT}. "
+                        "Результат не засчитан. Случай записан в /debug."
+                    )
+                try:
+                    await bot.send_message(owner_id, owner_notice)
+                except Exception:
+                    log.warning("Не удалось уведомить владельца о ручном вводе chat=%s user=%s",
+                                message.chat.id, message.from_user.id)
             if result.status == "not_found":
                 return
             if result.status == "forbidden":
                 await message.reply("🔒 Количество может указать только автор кружочка.")
             elif result.status == "expired":
                 await message.reply("⌛ Время ручного ввода истекло (15 минут). Отправь новый кружочек.")
-            elif result.status == "invalid":
+            elif result.status in ("invalid", "too_large"):
+                # Не сообщаем участнику порог и не различаем ошибки формата и превышение.
+                # Внутренняя причина и подозрительное значение остаются в журнале владельца.
+                await message.reply(manual_input_error_message(result.attempts_left))
+            elif result.status == "locked":
                 await message.reply(
-                    f"Напиши только число от 0 до {MAX_MANUAL_COUNT} в ответ на запрос бота."
+                    f"🔒 После {MAX_INVALID_MANUAL_ATTEMPTS} ошибочных попыток ручной ввод "
+                    "для этого кружочка заблокирован. Пришли новый кружочек или обратись к владельцу."
+                )
+            elif result.status == "daily_limit":
+                await message.reply(
+                    f"🛑 На сегодня исчерпан лимит: {MAX_MANUAL_VIDEOS_PER_DAY} "
+                    "кружочка с ручным вводом. Отправь видео для распознавания "
+                    "или обратись к владельцу."
                 )
             elif result.status == "accepted":
                 await message.reply(

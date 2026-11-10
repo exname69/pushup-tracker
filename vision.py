@@ -99,7 +99,19 @@ def analyze_video(
 
     try:
         started = time.perf_counter()
-        with genai.Client(api_key=api_key) as client:
+        with genai.Client(
+            api_key=api_key,
+            http_options=types.HttpOptions(
+                retry_options=types.HttpRetryOptions(
+                    attempts=3,         # 1 основная + 2 повторные
+                    initial_delay=2.0,  # Первая задержка — 2 сек
+                    max_delay=8.0,      # Максимальная задержка — 8 сек
+                    http_status_codes=[
+                        408, 429, 500, 502, 503, 504
+                    ],
+                ),
+            ),
+        ) as client:
             response = client.models.generate_content(
                 model=model,
                 contents=types.Content(

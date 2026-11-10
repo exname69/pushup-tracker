@@ -27,7 +27,7 @@ from tracker_core import (
     help_text, manual_input_error_message, owner_private, penalty_target, process_manual_reply, report_text,
     setup_manual_storage, today_text,
 )
-from vision import analyze_video
+from vision import ModelOverloadedError, analyze_video
 
 log = logging.getLogger(__name__)
 MAX_DOWNLOAD_BYTES = 20 * 1024 * 1024
@@ -770,9 +770,48 @@ async def main() -> None:
                     with tempfile.TemporaryDirectory(prefix="pushup-") as tempdir:
                         target = Path(tempdir) / "note.mp4"
                         await bot.download(note.file_id, destination=target, timeout=90)
-                        analysis = await asyncio.to_thread(
-                            analyze_video, target, duration_seconds=note.duration,
-                        )
+                        try:
+                            analysis = await asyncio.to_thread(
+                                analyze_video, target, duration_seconds=note.duration,
+                            )
+                        except ModelOverloadedError:
+                            fallback_model = DEBUG_GEMINI_MODEL
+                            primary_model = os.getenv(
+                                "GEMINI_MODEL", "gemini-3.5-flash-lite"
+                            ).strip()
+                            if fallback_model == primary_model:
+                                log.warning(
+                                    "No distinct fallback model: %s", fallback_model
+                                )
+                                analysis = None
+                            else:
+                                log.warning(
+                                    "Gemini 503: switching to %s chat=%s msg=%s",
+                                    fallback_model, message.chat.id, message.message_id,
+                                )
+                                try:
+                                    await message.reply(
+                                        "⚠️ Основная модель перегружена. "
+                                        "Пробую обработать кружок на более слабой "
+                                        "модели. Возможны ошибки в подсчёте."
+                                    )
+                                except Exception:
+                                    log.exception(
+                                        "Не удалось уведомить о fallback chat=%s msg=%s",
+                                        message.chat.id, message.message_id,
+                                    )
+                                try:
+                                    analysis = await asyncio.to_thread(
+                                        analyze_video, target,
+                                        duration_seconds=note.duration,
+                                        model_override=fallback_model,
+                                    )
+                                except ModelOverloadedError:
+                                    log.warning(
+                                        "Fallback Gemini 503 chat=%s msg=%s",
+                                        message.chat.id, message.message_id,
+                                    )
+                                    analysis = None
             except Exception:
                 log.exception("Ошибка анализа кружочка chat=%s msg=%s", message.chat.id, message.message_id)
                 await ask_manual(message, "Не удалось обработать этот кружочек автоматически.")

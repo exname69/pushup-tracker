@@ -19,6 +19,10 @@ MAX_VIDEO_BYTES = 20 * 1024 * 1024
 MAX_REPETITIONS = 1000
 
 
+class ModelOverloadedError(Exception):
+    """Gemini returned HTTP 503 (service overloaded)."""
+
+
 @dataclass(frozen=True)
 class Analysis:
     repetitions: int
@@ -44,7 +48,7 @@ def analyze_video(
     для диагностики, но НЕ должен записываться в статистику группы.
     """
     from google import genai
-    from google.genai import types
+    from google.genai import errors, types
 
     api_key = os.getenv("GEMINI_API_KEY", "").strip()
     if not api_key:
@@ -99,19 +103,7 @@ def analyze_video(
 
     try:
         started = time.perf_counter()
-        with genai.Client(
-            api_key=api_key,
-            http_options=types.HttpOptions(
-                retry_options=types.HttpRetryOptions(
-                    attempts=3,         # 1 основная + 2 повторные
-                    initial_delay=2.0,  # Первая задержка — 2 сек
-                    max_delay=8.0,      # Максимальная задержка — 8 сек
-                    http_status_codes=[
-                        408, 429, 500, 502, 503, 504
-                    ],
-                ),
-            ),
-        ) as client:
+        with genai.Client(api_key=api_key) as client:
             response = client.models.generate_content(
                 model=model,
                 contents=types.Content(
@@ -206,6 +198,12 @@ def analyze_video(
             requested_fps=fps,
             api_seconds=api_seconds,
         )
+    except errors.APIError as exc:
+        if exc.code == 503:
+            log.warning("Gemini: модель %s перегружена (HTTP 503)", model)
+            raise ModelOverloadedError(model) from exc
+        log.exception("Gemini API error: model=%s status=%s", model, exc.code)
+        return None
     except Exception:
         log.exception("Gemini: ошибка анализа видео")
         return None

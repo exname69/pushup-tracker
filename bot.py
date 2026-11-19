@@ -16,18 +16,19 @@ from zoneinfo import ZoneInfo
 
 from aiogram import BaseMiddleware, Bot, Dispatcher, F
 from aiogram.filters import Command
-from aiogram.types import BotCommand, ChatMemberUpdated, ForceReply, Message
+from aiogram.types import BotCommand, ChatMemberUpdated, Message
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from dotenv import load_dotenv
 
 from storage import Storage
 from tracker_core import (
     MANUAL_INPUT_TTL, MAX_MANUAL_COUNT, MANUAL_REVIEW_THRESHOLD,
-    MAX_INVALID_MANUAL_ATTEMPTS, MAX_MANUAL_VIDEOS_PER_DAY, create_pending_manual, daily_report_rows,
+    MAX_INVALID_MANUAL_ATTEMPTS, MAX_MANUAL_VIDEOS_PER_DAY, daily_report_rows,
     help_text, manual_input_error_message, owner_private, penalty_target, process_manual_reply, report_text,
     setup_manual_storage, today_text,
 )
-from vision import ModelOverloadedError, analyze_video
+from vision import analyze_video
+from video_workflow import VideoWorkflow
 
 log = logging.getLogger(__name__)
 MAX_DOWNLOAD_BYTES = 20 * 1024 * 1024
@@ -40,7 +41,6 @@ PUBLIC_COMMANDS = [
     BotCommand(command="today", description="Отжимания сегодня"),
     BotCommand(command="yesterday", description="Итоги вчера"),
     BotCommand(command="rules", description="Правила"),
-    BotCommand(command="pravila", description="Правила"),
     BotCommand(command="myid", description="Мой Telegram ID (личка)"),
 ]
 
@@ -288,48 +288,8 @@ async def main() -> None:
         return report_text(day, daily_report_rows(db, chat_id, day, tz, daily_target), daily_target)
 
     async with Bot(token=token) as bot:
-        async def ask_manual(message: Message, reason: str) -> None:
-            if not message.from_user or not message.video_note:
-                return
-            chat_id, message_id = message.chat.id, message.message_id
-            if db.has_video(chat_id, message_id):
-                return
-            if db.conn.execute(
-                "SELECT 1 FROM pending_manual WHERE chat_id=? AND video_message_id=?",
-                (chat_id, message_id),
-            ).fetchone():
-                return
-            inserted = create_pending_manual(
-                db, chat_id, message_id, message.from_user.id, message.from_user.full_name,
-                message.date,
-            )
-            if not inserted:
-                return
-            try:
-                prompt = await message.reply(
-                    f"⚠️ {html.escape(reason)}\n"
-                    f"✍️ {html.escape(message.from_user.full_name)}, укажи количество отжиманий "
-                    "целым неотрицательным числом в ответ на это сообщение.\n"
-                    f"Лимит: {MAX_MANUAL_VIDEOS_PER_DAY} ручных кружочка в сутки, "
-                    f"{MAX_INVALID_MANUAL_ATTEMPTS} попытки на ввод.\n"
-                    "⏳ На ввод есть 15 минут с момента запроса. "
-                    "Результат будет помечен как ручной — его можно перепроверить по кружочку.",
-                    parse_mode="HTML",
-                    reply_markup=ForceReply(input_field_placeholder="Например: 25", selective=True),
-                )
-            except Exception:
-                with db.conn:
-                    db.conn.execute(
-                        "DELETE FROM pending_manual WHERE chat_id=? AND video_message_id=?",
-                        (chat_id, message_id),
-                    )
-                log.exception("Не удалось запросить ручной ввод chat=%s msg=%s", chat_id, message_id)
-                return
-            with db.conn:
-                db.conn.execute(
-                    "UPDATE pending_manual SET prompt_message_id=? WHERE chat_id=? AND video_message_id=?",
-                    (prompt.message_id, chat_id, message_id),
-                )
+        workflow = VideoWorkflow(bot, db, access, tz, semaphore, DEBUG_GEMINI_MODEL)
+        dp.callback_query.register(workflow.on_callback, F.data.startswith("video:"))
 
         async def publish_yesterday() -> None:
             async with report_lock:
@@ -432,8 +392,10 @@ async def main() -> None:
                 db.register_chat(message.chat.id, message.chat.title or "Группа")
             await message.answer(
                 "🏋️ Пришлите видеокружочек с отжиманиями. Я посчитаю повторы.\n"
-                "Если видео не распознаётся, можно указать число отжиманий вручную "
-                "(15 минут на ввод, до 3 кружочков в сутки).\n"
+                "Результат можно изменить вручную или пересчитать "
+                "в течение 30 минут после первого результата или ошибки.\n"
+                f"Ручной ввод: до {MAX_MANUAL_VIDEOS_PER_DAY} разных кружочков в сутки.\n"
+                "Под кружочком появятся статус обработки и кнопки изменения результата и повторного анализа.\n"
                 f"Дневная норма: {daily_target}. Отчёт — в 00:00 ({tz.key}).\n"
                 "Список команд: /help"
             )
@@ -444,7 +406,7 @@ async def main() -> None:
                 db.register_chat(message.chat.id, message.chat.title or "Группа")
             await message.answer(help_text(), parse_mode="HTML")
 
-        @dp.message(Command("rules", "pravila"))
+        @dp.message(Command("rules"))
         async def on_rules(message: Message) -> None:
             try:
                 rules = rules_path.read_text(encoding="utf-8").strip()
@@ -628,7 +590,9 @@ async def main() -> None:
             if result.status == "forbidden":
                 await message.reply("🔒 Количество может указать только автор кружочка.")
             elif result.status == "expired":
-                await message.reply("⌛ Время ручного ввода истекло (15 минут). Отправь новый кружочек.")
+                await message.reply("⌛ Время ручного изменения истекло. Обратись к владельцу.")
+            elif result.status == "busy":
+                await message.reply("⏳ Кружочек сейчас обрабатывается. Дождись результата и повтори ввод.")
             elif result.status in ("invalid", "too_large"):
                 # Не сообщаем участнику порог и не различаем ошибки формата и превышение.
                 # Внутренняя причина и подозрительное значение остаются в журнале владельца.
@@ -645,6 +609,8 @@ async def main() -> None:
                     "или обратись к владельцу."
                 )
             elif result.status == "accepted":
+                if result.video_message_id is not None:
+                    await workflow.refresh_widget(message.chat.id, result.video_message_id)
                 await message.reply(
                     f"✍️ <b>{html.escape(result.name)}</b>: <b>{result.count}</b> отжиманий — "
                     "указано вручную, можно перепроверить по видео.",
@@ -756,79 +722,7 @@ async def main() -> None:
                 return
             if message.chat.type not in ("group", "supergroup"):
                 return
-            if not message.from_user or message.from_user.is_bot:
-                return
-            note = message.video_note
-            db.register_chat(message.chat.id, message.chat.title or "Группа")
-            if db.has_video(message.chat.id, message.message_id):
-                return
-            if note.file_size and note.file_size > MAX_DOWNLOAD_BYTES:
-                await ask_manual(message, "Кружочек превышает лимит скачивания (20 МБ).")
-                return
-            try:
-                async with semaphore:
-                    with tempfile.TemporaryDirectory(prefix="pushup-") as tempdir:
-                        target = Path(tempdir) / "note.mp4"
-                        await bot.download(note.file_id, destination=target, timeout=90)
-                        try:
-                            analysis = await asyncio.to_thread(
-                                analyze_video, target, duration_seconds=note.duration,
-                            )
-                        except ModelOverloadedError:
-                            fallback_model = DEBUG_GEMINI_MODEL
-                            primary_model = os.getenv(
-                                "GEMINI_MODEL", "gemini-3.5-flash-lite"
-                            ).strip()
-                            if fallback_model == primary_model:
-                                log.warning(
-                                    "No distinct fallback model: %s", fallback_model
-                                )
-                                analysis = None
-                            else:
-                                log.warning(
-                                    "Gemini 503: switching to %s chat=%s msg=%s",
-                                    fallback_model, message.chat.id, message.message_id,
-                                )
-                                try:
-                                    await message.reply(
-                                        "⚠️ Основная модель перегружена. "
-                                        "Пробую обработать кружок на более слабой "
-                                        "модели. Возможны ошибки в подсчёте."
-                                    )
-                                except Exception:
-                                    log.exception(
-                                        "Не удалось уведомить о fallback chat=%s msg=%s",
-                                        message.chat.id, message.message_id,
-                                    )
-                                try:
-                                    analysis = await asyncio.to_thread(
-                                        analyze_video, target,
-                                        duration_seconds=note.duration,
-                                        model_override=fallback_model,
-                                    )
-                                except ModelOverloadedError:
-                                    log.warning(
-                                        "Fallback Gemini 503 chat=%s msg=%s",
-                                        message.chat.id, message.message_id,
-                                    )
-                                    analysis = None
-            except Exception:
-                log.exception("Ошибка анализа кружочка chat=%s msg=%s", message.chat.id, message.message_id)
-                await ask_manual(message, "Не удалось обработать этот кружочек автоматически.")
-                return
-            if analysis is None or analysis.uncertain:
-                await ask_manual(message, "Не удалось уверенно распознать отжимания.")
-                return
-            name = message.from_user.full_name
-            inserted = db.save_video(
-                message.chat.id, message.message_id, message.from_user.id,
-                name, analysis.repetitions, message.date,
-            )
-            if inserted:
-                await message.reply(
-                    f"✅ {html.escape(name)}: <b>{analysis.repetitions}</b> отжиманий",
-                    parse_mode="HTML",
-                )
+            await workflow.on_video(message)
 
         scheduler.add_job(
             publish_yesterday, "cron", hour=0, minute=0,
@@ -836,6 +730,8 @@ async def main() -> None:
         )
         scheduler.add_job(purge_old_pending, "interval", hours=1,
                           id="clean_manual_pending", max_instances=1, coalesce=True)
+        scheduler.add_job(workflow.expire_actions, "interval", minutes=1,
+                          id="close_video_actions", max_instances=1, coalesce=True)
         scheduler.start()
         try:
             try:
@@ -843,6 +739,7 @@ async def main() -> None:
             except Exception:
                 log.exception("Не удалось обновить список команд Telegram")
             await bot.delete_webhook(drop_pending_updates=False)
+            await workflow.recover()
             await publish_yesterday()
             await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
         finally:

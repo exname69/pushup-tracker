@@ -3,9 +3,37 @@
 from __future__ import annotations
 
 import sqlite3
+from dataclasses import dataclass
 from datetime import date, datetime, time, timedelta, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
+
+VIDEO_ACTION_TTL = timedelta(minutes=30)
+
+
+@dataclass(frozen=True)
+class VideoJob:
+    chat_id: int
+    message_id: int
+    user_id: int
+    display_name: str
+    file_id: str
+    duration: int
+    file_size: int | None
+    sent_at_utc: str
+    widget_message_id: int | None
+    state: str
+    action_expires_at_utc: str | None
+    error: str
+    message_thread_id: int | None = None
+    actions_closed: bool = False
+
+
+_VIDEO_JOB_COLUMNS = (
+    "chat_id, message_id, user_id, display_name, file_id, duration, file_size, "
+    "sent_at_utc, widget_message_id, state, action_expires_at_utc, error, "
+    "message_thread_id, actions_closed"
+)
 
 
 class Storage:
@@ -37,6 +65,26 @@ class Storage:
             );
             CREATE INDEX IF NOT EXISTS ix_video_counts_chat_date
                 ON video_counts(chat_id, sent_at_utc);
+            CREATE TABLE IF NOT EXISTS video_jobs (
+                chat_id INTEGER NOT NULL,
+                message_id INTEGER NOT NULL,
+                user_id INTEGER NOT NULL,
+                display_name TEXT NOT NULL,
+                file_id TEXT NOT NULL,
+                duration INTEGER NOT NULL,
+                file_size INTEGER,
+                sent_at_utc TEXT NOT NULL,
+                widget_message_id INTEGER,
+                state TEXT NOT NULL DEFAULT 'queued',
+                action_expires_at_utc TEXT,
+                error TEXT NOT NULL DEFAULT '',
+                message_thread_id INTEGER,
+                actions_closed INTEGER NOT NULL DEFAULT 0,
+                widget_dirty INTEGER NOT NULL DEFAULT 1,
+                PRIMARY KEY (chat_id, message_id)
+            );
+            CREATE INDEX IF NOT EXISTS ix_video_jobs_expiry
+                ON video_jobs(actions_closed, action_expires_at_utc);
             CREATE TABLE IF NOT EXISTS reports (
                 chat_id INTEGER NOT NULL,
                 day TEXT NOT NULL,
@@ -56,6 +104,12 @@ class Storage:
                 ON daily_overrides(chat_id, day);
             """
         )
+        with self.conn:
+            columns = {row[1] for row in self.conn.execute("PRAGMA table_info(video_jobs)")}
+            if "widget_dirty" not in columns:
+                self.conn.execute(
+                    "ALTER TABLE video_jobs ADD COLUMN widget_dirty INTEGER NOT NULL DEFAULT 1"
+                )
 
     def register_chat(self, chat_id: int, title: str) -> None:
         now = datetime.now(timezone.utc).isoformat()
@@ -64,14 +118,6 @@ class Storage:
                 "INSERT INTO chats(chat_id, title, first_seen_utc) VALUES (?, ?, ?) "
                 "ON CONFLICT(chat_id) DO UPDATE SET title = excluded.title",
                 (chat_id, title, now),
-            )
-
-    def register_member(self, chat_id: int, user_id: int, display_name: str) -> None:
-        with self.conn:
-            self.conn.execute(
-                "INSERT INTO members(chat_id, user_id, display_name) VALUES (?, ?, ?) "
-                "ON CONFLICT(chat_id, user_id) DO UPDATE SET display_name = excluded.display_name",
-                (chat_id, user_id, display_name),
             )
 
     def member_name(self, chat_id: int, user_id: int) -> str | None:
@@ -132,6 +178,139 @@ class Storage:
             (chat_id, message_id),
         ).fetchone() is not None
 
+    def create_video_job(
+        self, chat_id: int, message_id: int, user_id: int, display_name: str,
+        file_id: str, duration: int, file_size: int | None, sent_at: datetime,
+        message_thread_id: int | None = None,
+    ) -> bool:
+        with self.conn:
+            cursor = self.conn.execute(
+                """INSERT OR IGNORE INTO video_jobs
+                   (chat_id, message_id, user_id, display_name, file_id,
+                    duration, file_size, sent_at_utc, message_thread_id)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (chat_id, message_id, user_id, display_name, file_id, duration,
+                 file_size, sent_at.astimezone(timezone.utc).isoformat(), message_thread_id),
+            )
+        return cursor.rowcount == 1
+
+    def get_video_job(self, chat_id: int, message_id: int) -> VideoJob | None:
+        row = self.conn.execute(
+            f"SELECT {_VIDEO_JOB_COLUMNS} FROM video_jobs WHERE chat_id=? AND message_id=?",
+            (chat_id, message_id),
+        ).fetchone()
+        return VideoJob(*row[:-1], bool(row[-1])) if row else None
+
+    def bind_video_widget(self, chat_id: int, message_id: int, widget_message_id: int | None) -> None:
+        with self.conn:
+            self.conn.execute(
+                "UPDATE video_jobs SET widget_message_id=? WHERE chat_id=? AND message_id=?",
+                (widget_message_id, chat_id, message_id),
+            )
+
+    def set_video_job_state(self, chat_id: int, message_id: int, state: str) -> None:
+        with self.conn:
+            self.conn.execute(
+                "UPDATE video_jobs SET state=?, error='', widget_dirty=1 "
+                "WHERE chat_id=? AND message_id=?",
+                (state, chat_id, message_id),
+            )
+
+    def finish_video_job(
+        self, chat_id: int, message_id: int, state: str, error: str = '',
+        now: datetime | None = None,
+    ) -> None:
+        now = now or datetime.now(timezone.utc)
+        if now.tzinfo is None:
+            raise ValueError("now должен содержать timezone")
+        deadline = (now.astimezone(timezone.utc) + VIDEO_ACTION_TTL).isoformat()
+        with self.conn:
+            self.conn.execute(
+                """UPDATE video_jobs SET state=?, error=?, widget_dirty=1,
+                       action_expires_at_utc=COALESCE(action_expires_at_utc, ?)
+                   WHERE chat_id=? AND message_id=?""",
+                (state, error, deadline, chat_id, message_id),
+            )
+
+    def video_jobs_to_recover(self) -> list[VideoJob]:
+        return [
+            VideoJob(*row[:-1], bool(row[-1]))
+            for row in self.conn.execute(
+                f"SELECT {_VIDEO_JOB_COLUMNS} FROM video_jobs "
+                "WHERE state IN ('queued', 'downloading', 'analyzing')"
+            )
+        ]
+
+    def video_widgets_to_refresh(self) -> list[VideoJob]:
+        return [
+            VideoJob(*row[:-1], bool(row[-1]))
+            for row in self.conn.execute(
+                f"SELECT {_VIDEO_JOB_COLUMNS} FROM video_jobs WHERE widget_dirty=1"
+            )
+        ]
+
+    def mark_video_widget_clean(self, chat_id: int, message_id: int) -> None:
+        with self.conn:
+            self.conn.execute(
+                "UPDATE video_jobs SET widget_dirty=0 WHERE chat_id=? AND message_id=?",
+                (chat_id, message_id),
+            )
+
+    def expired_video_widgets(self, now: datetime | None = None) -> list[VideoJob]:
+        now = now or datetime.now(timezone.utc)
+        if now.tzinfo is None:
+            raise ValueError("now должен содержать timezone")
+        return [
+            VideoJob(*row[:-1], bool(row[-1]))
+            for row in self.conn.execute(
+                f"SELECT {_VIDEO_JOB_COLUMNS} FROM video_jobs "
+                "WHERE actions_closed=0 AND widget_message_id IS NOT NULL "
+                "AND action_expires_at_utc<=?",
+                (now.astimezone(timezone.utc).isoformat(),),
+            )
+        ]
+
+    def mark_video_actions_closed(self, chat_id: int, message_id: int) -> None:
+        with self.conn:
+            self.conn.execute(
+                "UPDATE video_jobs SET actions_closed=1 WHERE chat_id=? AND message_id=?",
+                (chat_id, message_id),
+            )
+
+    def get_video_result(self, chat_id: int, message_id: int) -> tuple[int, bool] | None:
+        row = self.conn.execute(
+            "SELECT count, is_manual FROM video_counts WHERE chat_id=? AND message_id=?",
+            (chat_id, message_id),
+        ).fetchone()
+        return (row[0], bool(row[1])) if row else None
+
+    def replace_video_result(
+        self, chat_id: int, message_id: int, count: int, is_manual: bool = False,
+    ) -> bool:
+        """Заменить результат кружочка, сохранив автора, дату и расход ручной квоты."""
+        if type(count) is not int or count < 0:
+            raise ValueError("Количество должно быть целым неотрицательным числом")
+        job = self.get_video_job(chat_id, message_id)
+        if job is None:
+            return False
+        with self.conn:
+            self.conn.execute(
+                "INSERT INTO members(chat_id, user_id, display_name) VALUES (?, ?, ?) "
+                "ON CONFLICT(chat_id, user_id) DO UPDATE SET display_name = excluded.display_name",
+                (chat_id, job.user_id, job.display_name),
+            )
+            self.conn.execute(
+                """INSERT INTO video_counts
+                   (chat_id, message_id, user_id, count, sent_at_utc, is_manual, was_manual)
+                   VALUES (?, ?, ?, ?, ?, ?, ?)
+                   ON CONFLICT(chat_id, message_id) DO UPDATE SET
+                       count=excluded.count, is_manual=excluded.is_manual,
+                       was_manual=MAX(video_counts.was_manual, excluded.was_manual)""",
+                (chat_id, message_id, job.user_id, count, job.sent_at_utc,
+                 int(is_manual), int(is_manual)),
+            )
+        return True
+
     def save_video(
         self, chat_id: int, message_id: int, user_id: int,
         display_name: str, count: int, sent_at: datetime,
@@ -156,30 +335,6 @@ class Storage:
     def chat_first_seen(self, chat_id: int) -> datetime | None:
         row = self.conn.execute("SELECT first_seen_utc FROM chats WHERE chat_id=?", (chat_id,)).fetchone()
         return datetime.fromisoformat(row[0]) if row else None
-
-    def daily_results(self, chat_id: int, day: date, tz: ZoneInfo) -> list[tuple[str, int, int]]:
-        """(имя, число отжиманий с учётом корректировки, число кружочков)."""
-        start = datetime.combine(day, time.min, tzinfo=tz).astimezone(timezone.utc).isoformat()
-        end = datetime.combine(day + timedelta(days=1), time.min, tzinfo=tz).astimezone(timezone.utc).isoformat()
-        return self.conn.execute(
-            """
-            SELECT m.display_name,
-                   COALESCE(o.count, v.total, 0) AS total,
-                   COALESCE(v.videos, 0) AS videos
-            FROM members m
-            LEFT JOIN (
-                SELECT user_id, SUM(count) AS total, COUNT(*) AS videos
-                FROM video_counts
-                WHERE chat_id=? AND sent_at_utc>=? AND sent_at_utc<?
-                GROUP BY user_id
-            ) v ON v.user_id=m.user_id
-            LEFT JOIN daily_overrides o
-                ON o.chat_id=m.chat_id AND o.user_id=m.user_id AND o.day=?
-            WHERE m.chat_id=? AND (v.user_id IS NOT NULL OR o.user_id IS NOT NULL)
-            ORDER BY total DESC, videos DESC, m.display_name COLLATE NOCASE
-            """,
-            (chat_id, start, end, day.isoformat(), chat_id),
-        ).fetchall()
 
     def daily_user_total(
         self, chat_id: int, user_id: int, day: date, tz: ZoneInfo

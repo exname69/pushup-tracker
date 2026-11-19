@@ -8,11 +8,13 @@ from datetime import date, datetime, timedelta, timezone
 from typing import Any
 from zoneinfo import ZoneInfo
 
+from storage import VIDEO_ACTION_TTL
+
 MAX_MANUAL_COUNT = 96
 MANUAL_REVIEW_THRESHOLD = 80
 MAX_INVALID_MANUAL_ATTEMPTS = 3
 MAX_MANUAL_VIDEOS_PER_DAY = 4
-MANUAL_INPUT_TTL = timedelta(minutes=15)
+MANUAL_INPUT_TTL = VIDEO_ACTION_TTL
 PENALTY_EXTRA = 10
 
 
@@ -62,6 +64,11 @@ def setup_manual_storage(db: Any) -> None:
             db.conn.execute(
                 "ALTER TABLE video_counts ADD COLUMN is_manual INTEGER NOT NULL DEFAULT 0"
             )
+        if "was_manual" not in columns:
+            db.conn.execute(
+                "ALTER TABLE video_counts ADD COLUMN was_manual INTEGER NOT NULL DEFAULT 0"
+            )
+            db.conn.execute("UPDATE video_counts SET was_manual=1 WHERE is_manual=1")
         db.conn.execute(
             """CREATE TABLE IF NOT EXISTS pending_manual (
                 chat_id INTEGER NOT NULL,
@@ -104,26 +111,32 @@ def setup_manual_storage(db: Any) -> None:
 def create_pending_manual(
     db: Any, chat_id: int, video_message_id: int, user_id: int,
     display_name: str, sent_at_utc: datetime, created_at: datetime | None = None,
+    *, expires_at: datetime | None = None,
 ) -> bool:
     now = created_at or datetime.now(timezone.utc)
+    deadline = expires_at or manual_expires_at(now)
+    if deadline.tzinfo is None:
+        raise ValueError("expires_at должен содержать timezone")
     with db.conn:
         cursor = db.conn.execute(
             """INSERT OR IGNORE INTO pending_manual
                (chat_id, video_message_id, user_id, display_name, sent_at_utc, expires_at_utc)
                VALUES(?,?,?,?,?,?)""",
             (chat_id, video_message_id, user_id, display_name,
-             sent_at_utc.astimezone(timezone.utc).isoformat(), manual_expires_at(now).isoformat()),
+             sent_at_utc.astimezone(timezone.utc).isoformat(),
+             deadline.astimezone(timezone.utc).isoformat()),
         )
     return cursor.rowcount == 1
 
 
 @dataclass(frozen=True)
 class ManualReplyResult:
-    status: str  # not_found, forbidden, expired, invalid, too_large, locked, daily_limit, duplicate, accepted
+    status: str  # not_found, forbidden, expired, busy, invalid, too_large, locked, daily_limit, duplicate, accepted
     count: int | None = None
     name: str | None = None
     attempts_left: int | None = None
     notify_owner: bool = False
+    video_message_id: int | None = None
 
 
 def process_manual_reply(
@@ -131,7 +144,7 @@ def process_manual_reply(
     value: str | None, now: datetime | None = None,
     report_tz: ZoneInfo | timezone = timezone.utc,
 ) -> ManualReplyResult:
-    """Безопасный ручной ввод с лимитом 96, 3 попытками и 3 видео в сутки.
+    """Безопасный ручной ввод с ограничениями значения, попыток и видео в сутки.
 
     Проверки и запись выполняются без await. В рамках одного процесса бота
     операции не прерываются другой корутиной; уникальный ключ video_counts
@@ -148,16 +161,21 @@ def process_manual_reply(
         return ManualReplyResult("not_found")
     original_id, author_id, name, sent_at_utc, expires_at, invalid_attempts = pending
     if sender_id != author_id:
-        return ManualReplyResult("forbidden")
-    if is_manual_expired(expires_at, now):
+        return ManualReplyResult("forbidden", video_message_id=original_id)
+    job = db.get_video_job(chat_id, original_id)
+    if is_manual_expired(expires_at, now) or (
+        job is not None and is_manual_expired(job.action_expires_at_utc, now)
+    ):
         with db.conn:
             db.conn.execute(
                 "DELETE FROM pending_manual WHERE chat_id=? AND video_message_id=?",
                 (chat_id, original_id),
             )
-        return ManualReplyResult("expired")
+        return ManualReplyResult("expired", video_message_id=original_id)
+    if job is not None and job.state in ('queued', 'downloading', 'analyzing'):
+        return ManualReplyResult("busy", video_message_id=original_id)
     if invalid_attempts >= MAX_INVALID_MANUAL_ATTEMPTS:
-        return ManualReplyResult("locked", attempts_left=0)
+        return ManualReplyResult("locked", attempts_left=0, video_message_id=original_id)
 
     count = parse_manual_count(value)
     if count is None:
@@ -187,10 +205,12 @@ def process_manual_reply(
                 notify_owner = (prior == 0)
         if attempts_left == 0:
             return ManualReplyResult("locked", attempts_left=0, notify_owner=notify_owner,
-                                     count=int(raw) if too_large else None)
+                                     count=int(raw) if too_large else None,
+                                     video_message_id=original_id)
         return ManualReplyResult("too_large" if too_large else "invalid",
                                  count=int(raw) if too_large else None,
-                                 attempts_left=attempts_left, notify_owner=notify_owner)
+                                 attempts_left=attempts_left, notify_owner=notify_owner,
+                                 video_message_id=original_id)
 
     video_time = datetime.fromisoformat(sent_at_utc)
     video_day = video_time.astimezone(report_tz).date()
@@ -198,23 +218,33 @@ def process_manual_reply(
     end_utc = datetime.combine(video_day + timedelta(days=1), datetime.min.time(), tzinfo=report_tz).astimezone(timezone.utc)
     manual_today = db.conn.execute(
         """SELECT COUNT(*) FROM video_counts
-           WHERE chat_id=? AND user_id=? AND is_manual=1
+           WHERE chat_id=? AND user_id=? AND was_manual=1
              AND sent_at_utc>=? AND sent_at_utc<?""",
         (chat_id, sender_id, start_utc.isoformat(), end_utc.isoformat()),
     ).fetchone()[0]
-    if manual_today >= MAX_MANUAL_VIDEOS_PER_DAY:
+    previous = db.conn.execute(
+        "SELECT was_manual FROM video_counts WHERE chat_id=? AND message_id=?",
+        (chat_id, original_id),
+    ).fetchone()
+    already_manual = previous is not None and bool(previous[0])
+    if not already_manual and manual_today >= MAX_MANUAL_VIDEOS_PER_DAY:
         with db.conn:
             db.conn.execute(
                 "DELETE FROM pending_manual WHERE chat_id=? AND video_message_id=?",
                 (chat_id, original_id),
             )
-        return ManualReplyResult("daily_limit")
+        return ManualReplyResult("daily_limit", video_message_id=original_id)
 
-    inserted = db.save_video(chat_id, original_id, author_id, name, count, video_time)
+    if job is not None:
+        inserted = db.replace_video_result(chat_id, original_id, count, is_manual=True)
+        if inserted:
+            db.finish_video_job(chat_id, original_id, 'done', now=now)
+    else:
+        inserted = db.save_video(chat_id, original_id, author_id, name, count, video_time)
     with db.conn:
         if inserted:
             db.conn.execute(
-                "UPDATE video_counts SET is_manual=1 WHERE chat_id=? AND message_id=?",
+                "UPDATE video_counts SET is_manual=1, was_manual=1 WHERE chat_id=? AND message_id=?",
                 (chat_id, original_id),
             )
         db.conn.execute(
@@ -222,7 +252,8 @@ def process_manual_reply(
             (chat_id, original_id),
         )
     return ManualReplyResult("accepted" if inserted else "duplicate", count, name,
-                             notify_owner=bool(inserted and count >= MANUAL_REVIEW_THRESHOLD))
+                             notify_owner=bool(inserted and count >= MANUAL_REVIEW_THRESHOLD),
+                             video_message_id=original_id)
 
 
 def penalty_target(daily_target: int) -> int:
@@ -329,11 +360,12 @@ def help_text() -> str:
         "/help — список пользовательских команд\n"
         "/stats, /today — отжимания за сегодня\n"
         "/yesterday — подробные итоги вчера\n"
-        "/rules, /pravila — правила челленджа\n"
+        "/rules — правила челленджа\n"
         "/myid — твой Telegram ID (в личке)\n\n"
-        "Отправь видеокружочек с отжиманиями. Если распознавание не удалось, "
-        "появится запрос ручного ввода: целое неотрицательное число, "
-        "не более 3 кружочков в сутки, 15 минут."
+        "Отправь видеокружочек с отжиманиями. Под ним появится карточка обработки. "
+        "В течение 30 минут после первого результата или ошибки можно изменить "
+        "число вручную или повторить анализ кнопками. "
+        f"Ручной ввод: не более {MAX_MANUAL_VIDEOS_PER_DAY} разных кружочков в сутки."
     )
 
 

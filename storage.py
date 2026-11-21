@@ -9,6 +9,7 @@ from pathlib import Path
 from zoneinfo import ZoneInfo
 
 VIDEO_ACTION_TTL = timedelta(minutes=30)
+STRONG_RETRY_TTL = timedelta(minutes=5)
 
 
 @dataclass(frozen=True)
@@ -26,14 +27,38 @@ class VideoJob:
     action_expires_at_utc: str | None
     error: str
     message_thread_id: int | None = None
+    result_source: str = ""  # strong / weak / manual / пусто, если результата нет
+    retry_limit: int = 2
+    retry_used: int = 0
+    result_locked: bool = False
     actions_closed: bool = False
 
 
 _VIDEO_JOB_COLUMNS = (
     "chat_id, message_id, user_id, display_name, file_id, duration, file_size, "
     "sent_at_utc, widget_message_id, state, action_expires_at_utc, error, "
-    "message_thread_id, actions_closed"
+    "message_thread_id, result_source, retry_limit, retry_used, result_locked, actions_closed"
 )
+
+
+def video_action_flags(job: VideoJob, now: datetime | None = None) -> tuple[bool, bool]:
+    """(можно повторить, можно ввести вручную), независимо от наличия кнопки."""
+    now = now or datetime.now(timezone.utc)
+    if now.tzinfo is None or now.utcoffset() is None:
+        raise ValueError("now должен содержать timezone")
+    if job.state not in ("done", "failed") or job.result_locked or job.actions_closed:
+        return False, False
+    if not job.action_expires_at_utc:
+        return False, False
+    deadline = datetime.fromisoformat(job.action_expires_at_utc)
+    if deadline.tzinfo is None or now >= deadline:
+        return False, False
+    if job.retry_used < job.retry_limit:
+        return True, False
+    # После первого успешного подсчёта сильной моделью ручная правка не нужна.
+    if job.retry_limit == 2 and job.retry_used >= 2 and job.result_source != "strong":
+        return False, True
+    return False, False
 
 
 class Storage:
@@ -81,6 +106,10 @@ class Storage:
                 message_thread_id INTEGER,
                 actions_closed INTEGER NOT NULL DEFAULT 0,
                 widget_dirty INTEGER NOT NULL DEFAULT 1,
+                result_source TEXT NOT NULL DEFAULT '',
+                retry_limit INTEGER NOT NULL DEFAULT 2,
+                retry_used INTEGER NOT NULL DEFAULT 0,
+                result_locked INTEGER NOT NULL DEFAULT 0,
                 PRIMARY KEY (chat_id, message_id)
             );
             CREATE INDEX IF NOT EXISTS ix_video_jobs_expiry
@@ -109,6 +138,27 @@ class Storage:
             if "widget_dirty" not in columns:
                 self.conn.execute(
                     "ALTER TABLE video_jobs ADD COLUMN widget_dirty INTEGER NOT NULL DEFAULT 1"
+                )
+            # Старые завершённые задачи закрываем: их историю попыток восстановить нельзя.
+            if "result_source" not in columns:
+                self.conn.execute(
+                    "ALTER TABLE video_jobs ADD COLUMN result_source TEXT NOT NULL DEFAULT ''"
+                )
+            if "retry_limit" not in columns:
+                self.conn.execute(
+                    "ALTER TABLE video_jobs ADD COLUMN retry_limit INTEGER NOT NULL DEFAULT 2"
+                )
+            if "retry_used" not in columns:
+                self.conn.execute(
+                    "ALTER TABLE video_jobs ADD COLUMN retry_used INTEGER NOT NULL DEFAULT 0"
+                )
+            if "result_locked" not in columns:
+                self.conn.execute(
+                    "ALTER TABLE video_jobs ADD COLUMN result_locked INTEGER NOT NULL DEFAULT 0"
+                )
+                self.conn.execute(
+                    "UPDATE video_jobs SET result_locked=1, actions_closed=1, widget_dirty=1 "
+                    "WHERE state IN ('done', 'failed')"
                 )
 
     def register_chat(self, chat_id: int, title: str) -> None:
@@ -230,6 +280,114 @@ class Storage:
                        action_expires_at_utc=COALESCE(action_expires_at_utc, ?)
                    WHERE chat_id=? AND message_id=?""",
                 (state, error, deadline, chat_id, message_id),
+            )
+
+    def reserve_video_retry(
+        self, chat_id: int, message_id: int, now: datetime | None = None,
+    ) -> bool:
+        """Атомарно потратить одну попытку; повторный callback не пройдёт."""
+        now = now or datetime.now(timezone.utc)
+        if now.tzinfo is None:
+            raise ValueError("now должен содержать timezone")
+        with self.conn:
+            cursor = self.conn.execute(
+                """UPDATE video_jobs
+                   SET retry_used=retry_used+1, state='queued', error='', widget_dirty=1
+                   WHERE chat_id=? AND message_id=?
+                     AND state IN ('done', 'failed')
+                     AND result_locked=0 AND actions_closed=0
+                     AND retry_used < retry_limit
+                     AND action_expires_at_utc>?""",
+                (chat_id, message_id, now.astimezone(timezone.utc).isoformat()),
+            )
+        return cursor.rowcount == 1
+
+    def complete_video_analysis(
+        self, chat_id: int, message_id: int, count: int | None,
+        source: str | None = None, error: str = "", now: datetime | None = None,
+    ) -> None:
+        """Фиксирует результат попытки; не теряет старый подсчёт при неудаче."""
+        now = now or datetime.now(timezone.utc)
+        if now.tzinfo is None:
+            raise ValueError("now должен содержать timezone")
+        if source not in (None, "strong", "weak"):
+            raise ValueError("Неизвестный источник результата")
+        if count is None:
+            source = None
+        elif type(count) is not int or count < 0 or source is None:
+            raise ValueError("Для результата нужны count и source")
+        job = self.get_video_job(chat_id, message_id)
+        if job is None or job.result_locked:
+            return
+
+        deadline = job.action_expires_at_utc
+        limit = job.retry_limit
+        origin = job.result_source
+        locked = False
+
+        if source == "strong":
+            self.replace_video_result(chat_id, message_id, count)
+            origin = "strong"
+            if job.retry_used:
+                # Любой успешный повтор сильной модели — окончательный.
+                locked = True
+            else:
+                limit = 1
+                deadline = (now + STRONG_RETRY_TTL).astimezone(timezone.utc).isoformat()
+        elif source == "weak":
+            # Резервная модель работает только при первоначальном анализе.
+            self.replace_video_result(chat_id, message_id, count)
+            origin = "weak"
+            limit = 2
+            deadline = (now + VIDEO_ACTION_TTL).astimezone(timezone.utc).isoformat()
+        elif job.retry_used:
+            if job.result_source == "strong" and job.retry_limit == 1:
+                # Единственный повтор не удался: сохраняем первое число и закрываем.
+                locked = True
+            elif job.retry_used >= job.retry_limit:
+                # После двух неудачных повторов даём отдельное окно ручного ввода.
+                deadline = (now + VIDEO_ACTION_TTL).astimezone(timezone.utc).isoformat()
+        else:
+            # Первичный анализ не дал результата ни одной моделью.
+            limit = 2
+            deadline = (now + VIDEO_ACTION_TTL).astimezone(timezone.utc).isoformat()
+
+        state = "done" if self.get_video_result(chat_id, message_id) is not None else "failed"
+        with self.conn:
+            self.conn.execute(
+                """UPDATE video_jobs
+                   SET state=?, error=?, result_source=?, retry_limit=?,
+                       result_locked=?, actions_closed=?, action_expires_at_utc=?,
+                       widget_dirty=1
+                   WHERE chat_id=? AND message_id=?""",
+                (state, "" if state == "done" else error, origin, limit,
+                 int(locked), int(locked), deadline, chat_id, message_id),
+            )
+
+    def lock_manual_video_result(self, chat_id: int, message_id: int) -> None:
+        """Ручной ввод окончателен и больше не разрешает повторов."""
+        with self.conn:
+            self.conn.execute(
+                """UPDATE video_jobs
+                   SET state='done', error='', result_source='manual',
+                       result_locked=1, actions_closed=1, widget_dirty=1
+                   WHERE chat_id=? AND message_id=?""",
+                (chat_id, message_id),
+            )
+
+    def lock_expired_video_jobs(self, now: datetime | None = None) -> None:
+        """Истечение срока фиксируется в SQLite, даже если Telegram недоступен."""
+        now = now or datetime.now(timezone.utc)
+        if now.tzinfo is None:
+            raise ValueError("now должен содержать timezone")
+        with self.conn:
+            self.conn.execute(
+                """UPDATE video_jobs
+                   SET result_locked=1, actions_closed=1, widget_dirty=1
+                   WHERE state IN ('done', 'failed')
+                     AND result_locked=0 AND action_expires_at_utc IS NOT NULL
+                     AND action_expires_at_utc<=?""",
+                (now.astimezone(timezone.utc).isoformat(),),
             )
 
     def video_jobs_to_recover(self) -> list[VideoJob]:

@@ -115,6 +115,18 @@ class Storage:
             );
             CREATE INDEX IF NOT EXISTS ix_video_jobs_expiry
                 ON video_jobs(actions_closed, action_expires_at_utc);
+            CREATE TABLE IF NOT EXISTS model_requests (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                model TEXT NOT NULL,
+                requested_at_utc TEXT NOT NULL,
+                outcome TEXT NOT NULL,
+                status_code INTEGER,
+                prompt_tokens INTEGER NOT NULL DEFAULT 0,
+                output_tokens INTEGER NOT NULL DEFAULT 0,
+                total_tokens INTEGER NOT NULL DEFAULT 0
+            );
+            CREATE INDEX IF NOT EXISTS ix_model_requests_window
+                ON model_requests(model, requested_at_utc);
             CREATE TABLE IF NOT EXISTS reports (
                 chat_id INTEGER NOT NULL,
                 day TEXT NOT NULL,
@@ -390,6 +402,75 @@ class Storage:
                      AND action_expires_at_utc<=?""",
                 (now.astimezone(timezone.utc).isoformat(),),
             )
+
+    def refund_transient_video_retry(
+        self, chat_id: int, message_id: int, now: datetime | None = None,
+    ) -> None:
+        """Не списывать повтор, если все вызовы моделей упали по инфраструктуре."""
+        now = now or datetime.now(timezone.utc)
+        job = self.get_video_job(chat_id, message_id)
+        if job is None or not job.retry_used or job.state not in (
+            "queued", "downloading", "analyzing"
+        ):
+            return
+        result_exists = self.get_video_result(chat_id, message_id) is not None
+        ttl = STRONG_RETRY_TTL if job.result_source == "strong" else VIDEO_ACTION_TTL
+        deadline = (now + ttl).astimezone(timezone.utc).isoformat()
+        with self.conn:
+            self.conn.execute(
+                """UPDATE video_jobs SET retry_used=retry_used-1,
+                       state=?, error=?, action_expires_at_utc=?,
+                       widget_dirty=1
+                   WHERE chat_id=? AND message_id=? AND retry_used>0
+                     AND state IN ('queued', 'downloading', 'analyzing')""",
+                ("done" if result_exists else "failed",
+                 "" if result_exists else "Сервис Gemini временно недоступен.",
+                 deadline, chat_id, message_id),
+            )
+
+    def record_model_request(
+        self, model: str, outcome: str, status_code: int | None = None,
+        usage: dict[str, int] | None = None, now: datetime | None = None,
+    ) -> None:
+        """Локальная статистика вызовов, не квота аккаунта Google."""
+        now = now or datetime.now(timezone.utc)
+        usage = usage or {}
+        with self.conn:
+            self.conn.execute(
+                """INSERT INTO model_requests
+                   (model, requested_at_utc, outcome, status_code,
+                    prompt_tokens, output_tokens, total_tokens)
+                   VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                (model, now.astimezone(timezone.utc).isoformat(), outcome,
+                 status_code, usage.get("prompt_token_count", 0),
+                 usage.get("candidates_token_count", 0),
+                 usage.get("total_token_count", 0)),
+            )
+
+    def model_request_stats(self, now: datetime | None = None) -> dict[str, dict]:
+        now = now or datetime.now(timezone.utc)
+        results = {}
+        for window, start in (
+            ("minute", now - timedelta(minutes=1)),
+            ("day", now - timedelta(hours=24)),
+        ):
+            rows = self.conn.execute(
+                """SELECT model, COUNT(*),
+                          SUM(CASE WHEN outcome='success' THEN 1 ELSE 0 END),
+                          SUM(CASE WHEN status_code=429 THEN 1 ELSE 0 END),
+                          SUM(CASE WHEN status_code IN (503,504) THEN 1 ELSE 0 END),
+                          COALESCE(SUM(prompt_tokens),0),
+                          COALESCE(SUM(output_tokens),0),
+                          COALESCE(SUM(total_tokens),0)
+                   FROM model_requests WHERE requested_at_utc>=?
+                   GROUP BY model""",
+                (start.astimezone(timezone.utc).isoformat(),),
+            ).fetchall()
+            for model, attempts, successes, limited, unavailable, inp, out, total in rows:
+                results.setdefault(model, {})[window] = (
+                    attempts, successes, limited, unavailable, inp, out, total
+                )
+        return results
 
     def video_jobs_to_recover(self) -> list[VideoJob]:
         return [

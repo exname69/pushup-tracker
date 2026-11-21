@@ -50,6 +50,8 @@ def render_video_card(
     tz: ZoneInfo,
     note: str = "",
     now: datetime | None = None,
+    progress_tick: int = 0,
+    elapsed_seconds: int = 0,
 ) -> tuple[InputRichMessage, bool]:
     """Вернуть компактную карточку и признак доступности действий."""
     
@@ -86,6 +88,14 @@ def render_video_card(
         f"<p><strong>{html.escape(job.display_name)}</strong></p>",
         f"<p>{status}</p>",
     ]
+
+    if not terminal:
+        # Индикатор неопределённого прогресса: не изображаем процент выполнения.
+        width = 12
+        start = progress_tick % (width - 2)
+        bar = "".join("█" if start <= i < start + 3 else "░" for i in range(width))
+        elapsed = max(0, elapsed_seconds)
+        lines.append(f"<p><code>{bar}</code>  ⏱ {elapsed // 60}:{elapsed % 60:02d}</p>")
 
     if result is not None:
         count, manual = result

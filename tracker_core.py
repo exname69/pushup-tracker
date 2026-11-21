@@ -8,7 +8,7 @@ from datetime import date, datetime, timedelta, timezone
 from typing import Any
 from zoneinfo import ZoneInfo
 
-from storage import VIDEO_ACTION_TTL
+from storage import VIDEO_ACTION_TTL, video_action_flags
 
 MAX_MANUAL_COUNT = 96
 MANUAL_REVIEW_THRESHOLD = 80
@@ -174,6 +174,13 @@ def process_manual_reply(
         return ManualReplyResult("expired", video_message_id=original_id)
     if job is not None and job.state in ('queued', 'downloading', 'analyzing'):
         return ManualReplyResult("busy", video_message_id=original_id)
+    if job is not None and not video_action_flags(job, now)[1]:
+        with db.conn:
+            db.conn.execute(
+                "DELETE FROM pending_manual WHERE chat_id=? AND video_message_id=?",
+                (chat_id, original_id),
+            )
+        return ManualReplyResult("locked", video_message_id=original_id)
     if invalid_attempts >= MAX_INVALID_MANUAL_ATTEMPTS:
         return ManualReplyResult("locked", attempts_left=0, video_message_id=original_id)
 
@@ -238,7 +245,7 @@ def process_manual_reply(
     if job is not None:
         inserted = db.replace_video_result(chat_id, original_id, count, is_manual=True)
         if inserted:
-            db.finish_video_job(chat_id, original_id, 'done', now=now)
+            db.lock_manual_video_result(chat_id, original_id)
     else:
         inserted = db.save_video(chat_id, original_id, author_id, name, count, video_time)
     with db.conn:
@@ -363,8 +370,9 @@ def help_text() -> str:
         "/rules — правила челленджа\n"
         "/myid — твой Telegram ID (в личке)\n\n"
         "Отправь видеокружочек с отжиманиями. Под ним появится карточка обработки. "
-        "В течение 30 минут после первого результата или ошибки можно изменить "
-        "число вручную или повторить анализ кнопками. "
+        "После первого успешного подсчёта основной моделью есть 5 минут и один повтор. "
+        "Если результат дала резервная модель, доступны два повтора основной. "
+        "Ручной ввод открывается после двух неудачных повторов. "
         f"Ручной ввод: не более {MAX_MANUAL_VIDEOS_PER_DAY} разных кружочков в сутки."
     )
 

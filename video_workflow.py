@@ -6,6 +6,7 @@ import html
 import logging
 import os
 import re
+import time
 import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
@@ -17,7 +18,7 @@ from aiogram.types import CallbackQuery, ForceReply, Message, ReplyParameters
 
 from rich_messages import EditRichMessage, SendRichMessage, render_video_card
 
-from storage import Storage, VideoJob, video_action_flags
+from storage import Storage, VideoJob, VIDEO_PROCESS_TIMEOUT_SECONDS, video_action_flags
 from tracker_core import (
     MAX_INVALID_MANUAL_ATTEMPTS, MAX_MANUAL_VIDEOS_PER_DAY, create_pending_manual,
 )
@@ -62,7 +63,10 @@ class VideoWorkflow:
             and datetime.now(timezone.utc) >= datetime.fromisoformat(job.action_expires_at_utc)
         )
 
-    async def refresh_widget(self, chat_id: int, message_id: int, note: str = "") -> None:
+    async def refresh_widget(
+        self, chat_id: int, message_id: int, note: str = "",
+        *, progress_tick: int = 0, elapsed_seconds: int = 0,
+    ) -> None:
         """Ошибка Telegram не отменяет сохранение результата или сам анализ."""
         key = (chat_id, message_id)
         lock = self._widget_locks.setdefault(key, asyncio.Lock())
@@ -72,7 +76,10 @@ class VideoWorkflow:
                 if job is None:
                     return
                 result = self.db.get_video_result(*key)
-                content, actions_open = render_video_card(job, result, self.tz, note)
+                content, actions_open = render_video_card(
+                    job, result, self.tz, note,
+                    progress_tick=progress_tick, elapsed_seconds=elapsed_seconds,
+                )
                 try:
                     if job.widget_message_id is None:
                         widget = await self.bot(SendRichMessage(
@@ -150,6 +157,31 @@ class VideoWorkflow:
         finally:
             self._active.discard(key)
 
+    async def _animate_progress(
+        self, chat_id: int, message_id: int, started: float,
+    ) -> None:
+        """Пульсирующий индикатор ожидания, не псевдопроцент Gemini."""
+        tick = 0
+        while True:
+            await asyncio.sleep(2)
+            job = self.db.get_video_job(chat_id, message_id)
+            if job is None or job.state not in BUSY_STATES:
+                return
+            tick += 1
+            elapsed = int(time.monotonic() - started)
+            try:
+                # На периодическом тике не позволяем Telegram надолго
+                # задерживать завершение анализа.
+                async with asyncio.timeout(6):
+                    await self.refresh_widget(
+                        chat_id, message_id, progress_tick=tick,
+                        elapsed_seconds=elapsed,
+                    )
+            except TimeoutError:
+                log.debug("Таймаут обновления индикатора chat=%s msg=%s", chat_id, message_id)
+            except Exception:
+                log.exception("Ошибка обновления индикатора chat=%s msg=%s", chat_id, message_id)
+
     async def _process(self, chat_id: int, message_id: int) -> None:
         key = (chat_id, message_id)
         job = self.db.get_video_job(*key)
@@ -159,60 +191,76 @@ class VideoWorkflow:
         source = None
         error = "Не удалось уверенно распознать отжимания."
         is_retry = job.retry_used > 0
+        started = time.monotonic()
+        heartbeat = asyncio.create_task(self._animate_progress(*key, started))
         try:
-            if job.file_size and job.file_size > MAX_VIDEO_BYTES:
-                error = "Кружочек превышает лимит скачивания (20 МБ)."
-            else:
-                async with self.semaphore:
-                    self.db.set_video_job_state(*key, "downloading")
-                    await self.refresh_widget(*key)
-                    with tempfile.TemporaryDirectory(prefix="pushup-") as tempdir:
-                        target = Path(tempdir) / "note.mp4"
-                        await self.bot.download(job.file_id, destination=target, timeout=90)
-                        self.db.set_video_job_state(*key, "analyzing")
+            # Ограничивает весь цикл: ожидание очереди, загрузку и обе модели.
+            async with asyncio.timeout(VIDEO_PROCESS_TIMEOUT_SECONDS):
+                if job.file_size and job.file_size > MAX_VIDEO_BYTES:
+                    error = "Кружочек превышает лимит скачивания (20 МБ)."
+                else:
+                    async with self.semaphore:
+                        self.db.set_video_job_state(*key, "downloading")
                         await self.refresh_widget(*key)
+                        with tempfile.TemporaryDirectory(prefix="pushup-") as tempdir:
+                            target = Path(tempdir) / "note.mp4"
+                            await self.bot.download(job.file_id, destination=target, timeout=90)
+                            self.db.set_video_job_state(*key, "analyzing")
+                            await self.refresh_widget(*key)
 
-                        # Каждая попытка сначала использует сильную модель.
-                        # Слабую пробуем только при первоначальном анализе.
-                        try:
-                            primary = await asyncio.to_thread(
-                                analyze_video, target, duration_seconds=job.duration,
-                            )
-                        except ModelOverloadedError:
-                            primary = None
-                            log.warning("Сильная модель перегружена chat=%s msg=%s", *key)
-
-                        if primary is not None and not primary.uncertain:
-                            analysis = primary
-                            source = "strong"
-                        elif not is_retry:
-                            primary_name = os.getenv(
-                                "GEMINI_MODEL", "gemini-3.5-flash-lite"
-                            ).strip()
-                            if primary_name != self.fallback_model:
-                                await self.refresh_widget(
-                                    *key, note="Пробую резервную модель…",
+                            # Каждая попытка начинается с сильной модели.
+                            # Резервную вызываем только при первичном анализе.
+                            try:
+                                primary = await asyncio.to_thread(
+                                    analyze_video, target, duration_seconds=job.duration,
                                 )
-                                try:
-                                    fallback = await asyncio.to_thread(
-                                        analyze_video, target, duration_seconds=job.duration,
-                                        model_override=self.fallback_model,
+                            except ModelOverloadedError:
+                                primary = None
+                                log.warning("Основная модель перегружена chat=%s msg=%s", *key)
+
+                            if primary is not None and not primary.uncertain:
+                                analysis = primary
+                                source = "strong"
+                            elif not is_retry:
+                                primary_name = os.getenv(
+                                    "GEMINI_MODEL", "gemini-3.5-flash-lite"
+                                ).strip()
+                                if primary_name != self.fallback_model:
+                                    await self.refresh_widget(
+                                        *key, note="Пробую резервную модель…",
                                     )
-                                except ModelOverloadedError:
-                                    fallback = None
-                                    log.warning(
-                                        "Резервная модель перегружена chat=%s msg=%s", *key
-                                    )
-                                if fallback is not None and not fallback.uncertain:
-                                    analysis = fallback
-                                    source = "weak"
+                                    try:
+                                        fallback = await asyncio.to_thread(
+                                            analyze_video, target,
+                                            duration_seconds=job.duration,
+                                            model_override=self.fallback_model,
+                                        )
+                                    except ModelOverloadedError:
+                                        fallback = None
+                                        log.warning(
+                                            "Резервная модель перегружена chat=%s msg=%s", *key
+                                        )
+                                    if fallback is not None and not fallback.uncertain:
+                                        analysis = fallback
+                                        source = "weak"
+        except TimeoutError:
+            error = "⏱ Время обработки истекло (2 минуты). Можно повторить анализ."
+            log.warning("Превышен общий таймаут обработки chat=%s msg=%s", *key)
         except Exception:
             log.exception("Ошибка обработки кружочка chat=%s msg=%s", *key)
             error = "Не удалось обработать видео."
+        finally:
+            heartbeat.cancel()
+            try:
+                await heartbeat
+            except asyncio.CancelledError:
+                pass
 
+        # Поздние ответы фонового потока не сохраняются: итог фиксирует
+        # только эта корутина, после выхода из timeout-контекста.
         self.db.complete_video_analysis(
             *key,
-            count=analysis.repetitions if analysis is not None else None,
+            count=analysis.repetitions if source is not None else None,
             source=source,
             error=error,
         )

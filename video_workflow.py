@@ -22,7 +22,7 @@ from tracker_core import (
     MAX_INVALID_MANUAL_ATTEMPTS, MAX_MANUAL_VIDEOS_PER_DAY, create_pending_manual,
 )
 from vision import (
-    INITIAL_MODEL_CHAIN, RETRY_MODEL_CHAIN, WEAK_MODEL,
+    INITIAL_MODEL_CHAIN, RETRY_MODEL_CHAIN, FALLBACK_MODEL,
     MAX_VIDEO_BYTES, ModelOverloadedError, analyze_video,
 )
 
@@ -255,7 +255,7 @@ class VideoWorkflow:
 
                                 if candidate is not None and not candidate.uncertain:
                                     analysis = candidate
-                                    source = "weak" if model == WEAK_MODEL else "strong"
+                                    source = "weak" if model == FALLBACK_MODEL else "strong"
                                     break
         except TimeoutError:
             transient_failure = True

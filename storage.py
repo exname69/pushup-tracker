@@ -10,6 +10,7 @@ from zoneinfo import ZoneInfo
 
 VIDEO_ACTION_TTL = timedelta(minutes=30)
 STRONG_RETRY_TTL = timedelta(minutes=5)
+VIDEO_PROCESS_TIMEOUT_SECONDS = 120  # Общий предел: очередь + скачивание + Gemini
 
 
 @dataclass(frozen=True)

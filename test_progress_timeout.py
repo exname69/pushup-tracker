@@ -39,7 +39,7 @@ class ProgressAndTimeoutTests(unittest.IsolatedAsyncioTestCase):
         self.bot.download.side_effect = download
         self.workflow = VideoWorkflow(
             self.bot, self.db, StubAccess(), ZoneInfo("UTC"),
-            asyncio.Semaphore(1), "gemini-fallback",
+            asyncio.Semaphore(1),
         )
         self.workflow.refresh_widget = AsyncMock()
 

@@ -59,6 +59,7 @@ class PrivateWorkflowTests(unittest.TestCase):
         self.assertEqual(job.state, "queued")
         self.assertEqual(job.user_id, 123)
         self.assertTrue(self.workflow.job_allowed(job))
+        self.assertEqual(self.db.chat_ids(), [])  # Личка не участвует в групповых cron-отчётах.
         self.workflow.refresh_widget.assert_awaited_once_with(123, 50)
         self.workflow._process.assert_awaited_once_with(123, 50)
 

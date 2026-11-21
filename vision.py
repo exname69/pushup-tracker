@@ -103,7 +103,12 @@ def analyze_video(
 
     try:
         started = time.perf_counter()
-        with genai.Client(api_key=api_key) as client:
+        # SDK timeout ограничивает фоновые HTTP-запросы, даже если asyncio
+        # уже прекратил ожидание результата to_thread().
+        with genai.Client(
+            api_key=api_key,
+            http_options=types.HttpOptions(timeout=55_000),
+        ) as client:
             response = client.models.generate_content(
                 model=model,
                 contents=types.Content(

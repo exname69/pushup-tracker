@@ -164,7 +164,7 @@ class VideoWorkflow:
         """Пульсирующий индикатор ожидания, не псевдопроцент Gemini."""
         tick = 0
         while True:
-            await asyncio.sleep(2)
+            await asyncio.sleep(1)
             job = self.db.get_video_job(chat_id, message_id)
             if job is None or job.state not in BUSY_STATES:
                 return
@@ -192,6 +192,10 @@ class VideoWorkflow:
         source = None
         error = "Не удалось уверенно распознать отжимания."
         is_retry = job.retry_used > 0
+        # True, если модель вернула неопределённость или невалидный результат.
+        # В таком случае повтор расходуется; при чистой ошибке API — нет.
+        definite_failure = False
+        transient_failure = False
         started = time.monotonic()
         heartbeat = asyncio.create_task(self._animate_progress(*key, started))
         try:
@@ -228,11 +232,25 @@ class VideoWorkflow:
                                         analyze_video, target, duration_seconds=job.duration,
                                         model_override=model,
                                     )
-                                except ModelOverloadedError:
+                                except ModelOverloadedError as exc:
+                                    transient_failure = True
                                     candidate = None
+                                    self.db.record_model_request(
+                                        model, "api_error", status_code=exc.status,
+                                    )
                                     log.warning(
-                                        "Gemini: перегружена model=%s chat=%s msg=%s",
-                                        model, *key,
+                                        "Gemini API unavailable model=%s status=%s chat=%s msg=%s",
+                                        model, exc.status, *key,
+                                    )
+                                else:
+                                    definite_failure |= (
+                                        candidate is None or candidate.uncertain
+                                    )
+                                    self.db.record_model_request(
+                                        model,
+                                        "success" if candidate is not None and not candidate.uncertain
+                                        else "uncertain",
+                                        usage=candidate.usage_metadata if candidate else None,
                                     )
 
                                 if candidate is not None and not candidate.uncertain:
@@ -240,6 +258,7 @@ class VideoWorkflow:
                                     source = "weak" if model == WEAK_MODEL else "strong"
                                     break
         except TimeoutError:
+            transient_failure = True
             error = "⏱ Время обработки истекло (2 минуты). Можно повторить анализ."
             log.warning("Превышен общий таймаут обработки chat=%s msg=%s", *key)
         except Exception:
@@ -251,6 +270,15 @@ class VideoWorkflow:
                 await heartbeat
             except asyncio.CancelledError:
                 pass
+
+        # Если все ответы были инфраструктурными ошибками, восстанавливаем
+        # попытку: 503/504/429/таймаут не являются ошибкой подсчёта.
+        if is_retry and transient_failure and not definite_failure and source is None:
+            self.db.refund_transient_video_retry(*key)
+            await self.refresh_widget(
+                *key, note="Сервис Gemini временно недоступен. Попытка возвращена."
+            )
+            return
 
         # Поздние ответы фонового потока не сохраняются: итог фиксирует
         # только эта корутина, после выхода из timeout-контекста.

@@ -13,6 +13,7 @@ from zoneinfo import ZoneInfo
 from rich_messages import render_video_card
 from storage import Storage
 from tracker_core import setup_manual_storage
+from vision import Analysis
 from video_workflow import VideoWorkflow
 
 
@@ -66,7 +67,7 @@ class ProgressAndTimeoutTests(unittest.IsolatedAsyncioTestCase):
     async def test_processing_timeout_converts_stalled_model_into_failed_card(self):
         def slow_model(*args, **kwargs):
             time.sleep(0.15)
-            return None
+            return Analysis(repetitions=88)
 
         with (
             patch("video_workflow.VIDEO_PROCESS_TIMEOUT_SECONDS", 0.03),
@@ -79,6 +80,10 @@ class ProgressAndTimeoutTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("Время обработки истекло", job.error)
         self.assertIsNone(self.db.get_video_result(123, 50))
         self.assertEqual(job.retry_used, 0)
+        # Фоновый HTTP-поток может завершиться позже корутины: его
+        # результат не должен перезаписать сохранённую ошибку.
+        await asyncio.sleep(0.2)
+        self.assertIsNone(self.db.get_video_result(123, 50))
         self.workflow.refresh_widget.assert_awaited()
 
     async def test_fast_failure_has_no_progress_bar(self):

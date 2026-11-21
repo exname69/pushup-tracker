@@ -1,8 +1,7 @@
 
 """Подсчёт отжиманий через Gemini Video API.
 
-Нужен GEMINI_API_KEY. Модель и параметры можно задать через окружение:
-GEMINI_MODEL.
+В .env нужен только GEMINI_API_KEY. Приоритет моделей задан константами ниже.
 """
 from __future__ import annotations
 
@@ -17,6 +16,16 @@ from pathlib import Path
 log = logging.getLogger(__name__)
 MAX_VIDEO_BYTES = 20 * 1024 * 1024
 MAX_REPETITIONS = 1000
+
+# Единственный источник конфигурации моделей, без GEMINI_MODEL из .env.
+PRIMARY_MODEL = "gemini-3.6-flash"       # 1-я: текущая сильная модель
+SECONDARY_MODEL = "gemini-4-hydrogen"    # 2-я: сильная модель
+WEAK_MODEL = "gemini-3.5-flash-lite"     # 3-я: лёгкая резервная модель
+
+INITIAL_MODEL_CHAIN = (PRIMARY_MODEL, SECONDARY_MODEL, WEAK_MODEL)
+RETRY_MODEL_CHAIN = (PRIMARY_MODEL, SECONDARY_MODEL)  # Повторы только сильными
+MODEL_HTTP_TIMEOUT_MS = 35_000  # 3 x 35 с укладываются в общий лимит 120 с
+HYDROGEN_THINKING_LEVEL = "MEDIUM"
 
 
 class ModelOverloadedError(Exception):
@@ -65,7 +74,7 @@ def analyze_video(
         return None
 
     fps = max(2, min(int(target_fps), 8))
-    model = (model_override or os.getenv("GEMINI_MODEL", "gemini-3.5-flash-lite")).strip()
+    model = (model_override or PRIMARY_MODEL).strip()
 
     prompt = (
         "Count ALL visible push-up-like movements in the video. "
@@ -107,7 +116,7 @@ def analyze_video(
         # уже прекратил ожидание результата to_thread().
         with genai.Client(
             api_key=api_key,
-            http_options=types.HttpOptions(timeout=55_000),
+            http_options=types.HttpOptions(timeout=MODEL_HTTP_TIMEOUT_MS),
         ) as client:
             response = client.models.generate_content(
                 model=model,
@@ -125,7 +134,15 @@ def analyze_video(
                 config=types.GenerateContentConfig(
                     response_mime_type="application/json",
                     response_schema=response_schema,
-                    temperature=0,
+                    # Gemini 4 Hydrogen игнорирует temperature; используем
+                    # поддерживаемый thinking_level вместо него.
+                    **(
+                        {"thinking_config": types.ThinkingConfig(
+                            thinking_level=HYDROGEN_THINKING_LEVEL,
+                        )}
+                        if model == SECONDARY_MODEL
+                        else {"temperature": 0}
+                    ),
                 ),
             )
         api_seconds = time.perf_counter() - started

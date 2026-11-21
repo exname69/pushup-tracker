@@ -163,7 +163,7 @@ class VideoWorkflow:
         """Пульсирующий индикатор ожидания, не псевдопроцент Gemini."""
         tick = 0
         while True:
-            await asyncio.sleep(8)
+            await asyncio.sleep(2)
             job = self.db.get_video_job(chat_id, message_id)
             if job is None or job.state not in BUSY_STATES:
                 return

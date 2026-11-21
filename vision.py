@@ -20,12 +20,12 @@ MAX_VIDEO_BYTES = 20 * 1024 * 1024
 MAX_REPETITIONS = 1000
 
 # Единственный источник конфигурации моделей, без GEMINI_MODEL из .env.
-PRIMARY_MODEL = "gemini-3.6-flash"       # 1-я: текущая сильная модель
-SECONDARY_MODEL = "gemini-4-hydrogen"    # 2-я: сильная модель
-WEAK_MODEL = "gemini-3.5-flash-lite"     # 3-я: лёгкая резервная модель
+PRIMARY_MODEL = "gemini-3.8-flash"       # 1-я, основная
+SECONDARY_MODEL = "gemini-4-hydrogen"    # 2-я, сильная резервная
+FALLBACK_MODEL = "gemini-3.6-flash"      # 3-я, последняя резервная
 
-INITIAL_MODEL_CHAIN = (PRIMARY_MODEL, SECONDARY_MODEL, WEAK_MODEL)
-RETRY_MODEL_CHAIN = (PRIMARY_MODEL, SECONDARY_MODEL)  # Повторы только сильными
+INITIAL_MODEL_CHAIN = (PRIMARY_MODEL, SECONDARY_MODEL, FALLBACK_MODEL)
+RETRY_MODEL_CHAIN = (PRIMARY_MODEL, SECONDARY_MODEL)  # Повторы только 1-й и 2-й
 MODEL_HTTP_TIMEOUT_MS = 35_000  # 3 x 35 с укладываются в общий лимит 120 с
 HYDROGEN_THINKING_LEVEL = "MEDIUM"
 

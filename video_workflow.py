@@ -17,7 +17,7 @@ from aiogram.types import CallbackQuery, ForceReply, Message, ReplyParameters
 
 from rich_messages import EditRichMessage, SendRichMessage, render_video_card
 
-from storage import Storage, VideoJob
+from storage import Storage, VideoJob, video_action_flags
 from tracker_core import (
     MAX_INVALID_MANUAL_ATTEMPTS, MAX_MANUAL_VIDEOS_PER_DAY, create_pending_manual,
 )
@@ -100,13 +100,17 @@ class VideoWorkflow:
         if current is None:
             return
         # Ручной ответ мог изменить результат, пока Telegram принимал editMessageText.
-        if (current.state, current.error, current.action_expires_at_utc, self.db.get_video_result(*key)) != (
-            job.state, job.error, job.action_expires_at_utc, result,
+        if (
+            current.state, current.error, current.action_expires_at_utc,
+            current.retry_used, current.result_source, current.result_locked,
+            self.db.get_video_result(*key),
+        ) != (
+            job.state, job.error, job.action_expires_at_utc,
+            job.retry_used, job.result_source, job.result_locked, result,
         ):
             return
         self.db.mark_video_widget_clean(*key)
-        if not actions_open and self.expired(job) and job.state not in BUSY_STATES:
-            self.db.mark_video_actions_closed(*key)
+        # Блокировка производится в БД независимо от успешного Telegram edit.
 
     async def on_video(self, message: Message) -> None:
         if not message.from_user or message.from_user.is_bot or not message.video_note:
@@ -134,10 +138,12 @@ class VideoWorkflow:
         if job is None:
             return
         analysis = None
-        error = "Не удалось уверенно распознать отжимания. Можно указать число вручную или повторить анализ."
+        source = None
+        error = "Не удалось уверенно распознать отжимания."
+        is_retry = job.retry_used > 0
         try:
             if job.file_size and job.file_size > MAX_VIDEO_BYTES:
-                error = "Кружочек превышает лимит скачивания (20 МБ). Можно указать число вручную."
+                error = "Кружочек превышает лимит скачивания (20 МБ)."
             else:
                 async with self.semaphore:
                     self.db.set_video_job_state(*key, "downloading")
@@ -147,31 +153,51 @@ class VideoWorkflow:
                         await self.bot.download(job.file_id, destination=target, timeout=90)
                         self.db.set_video_job_state(*key, "analyzing")
                         await self.refresh_widget(*key)
+
+                        # Каждая попытка сначала использует сильную модель.
+                        # Слабую пробуем только при первоначальном анализе.
                         try:
-                            analysis = await asyncio.to_thread(
+                            primary = await asyncio.to_thread(
                                 analyze_video, target, duration_seconds=job.duration,
                             )
                         except ModelOverloadedError:
-                            primary = os.getenv("GEMINI_MODEL", "gemini-3.5-flash-lite").strip()
-                            if primary != self.fallback_model:
+                            primary = None
+                            log.warning("Сильная модель перегружена chat=%s msg=%s", *key)
+
+                        if primary is not None and not primary.uncertain:
+                            analysis = primary
+                            source = "strong"
+                        elif not is_retry:
+                            primary_name = os.getenv(
+                                "GEMINI_MODEL", "gemini-3.5-flash-lite"
+                            ).strip()
+                            if primary_name != self.fallback_model:
                                 await self.refresh_widget(
-                                    *key, note="Основная модель перегружена. Пробую резервную — возможны ошибки подсчёта.",
+                                    *key, note="Пробую резервную модель…",
                                 )
                                 try:
-                                    analysis = await asyncio.to_thread(
+                                    fallback = await asyncio.to_thread(
                                         analyze_video, target, duration_seconds=job.duration,
                                         model_override=self.fallback_model,
                                     )
                                 except ModelOverloadedError:
-                                    log.warning("Резервная модель перегружена chat=%s msg=%s", *key)
+                                    fallback = None
+                                    log.warning(
+                                        "Резервная модель перегружена chat=%s msg=%s", *key
+                                    )
+                                if fallback is not None and not fallback.uncertain:
+                                    analysis = fallback
+                                    source = "weak"
         except Exception:
             log.exception("Ошибка обработки кружочка chat=%s msg=%s", *key)
-            error = "Не удалось обработать видео. Можно указать число вручную или повторить анализ."
-        if analysis is not None and not analysis.uncertain:
-            self.db.replace_video_result(*key, analysis.repetitions)
-            self.db.finish_video_job(*key, "done")
-        else:
-            self.db.finish_video_job(*key, "failed", error=error)
+            error = "Не удалось обработать видео."
+
+        self.db.complete_video_analysis(
+            *key,
+            count=analysis.repetitions if analysis is not None else None,
+            source=source,
+            error=error,
+        )
         await self.refresh_widget(*key)
 
     @staticmethod
@@ -203,18 +229,27 @@ class VideoWorkflow:
         if query.from_user.id != job.user_id:
             await self._answer(query, "Изменить результат может только автор кружочка.", True)
             return
-        if self.expired(job):
-            await self._answer(query, "Прошло 30 минут. Изменения больше недоступны.", True)
+        if key in self._active or job.state in BUSY_STATES:
+            await self._answer(query, "Кружочек уже обрабатывается. Дождись результата.")
+            return
+
+        can_retry, can_manual = video_action_flags(job)
+        if action == "retry" and not can_retry:
+            await self._answer(query, "Повторные попытки недоступны или закончились.", True)
             await self.refresh_widget(*key)
             return
-        if key in self._active or job.state in BUSY_STATES or not job.action_expires_at_utc:
-            await self._answer(query, "Этот кружочек уже обрабатывается. Дождись результата.")
+        if action == "manual" and not can_manual:
+            await self._answer(query, "Ручной ввод пока недоступен.", True)
+            await self.refresh_widget(*key)
             return
+
         self._active.add(key)
         try:
             if action == "retry":
-                # Резервируем кружочек до первого await: двойной клик не запустит два анализа.
-                self.db.set_video_job_state(*key, "queued")
+                # Условный SQL UPDATE не допускает двойного списания попытки.
+                if not self.db.reserve_video_retry(*key):
+                    await self._answer(query, "Повтор недоступен.", True)
+                    return
                 await self._answer(query, "Повторный анализ запущен.")
                 await self.refresh_widget(*key)
                 await self._process(*key)
@@ -267,9 +302,9 @@ class VideoWorkflow:
 
     async def recover(self) -> None:
         for job in self.db.video_jobs_to_recover():
-            self.db.finish_video_job(
-                job.chat_id, job.message_id, "failed",
-                error="Обработка прервалась при перезапуске бота. Можно запустить её заново.",
+            self.db.complete_video_analysis(
+                job.chat_id, job.message_id, count=None,
+                error="Обработка прервалась при перезапуске бота.",
             )
             if self.access.allowed("group", job.chat_id):
                 await self.refresh_widget(job.chat_id, job.message_id)
@@ -283,6 +318,7 @@ class VideoWorkflow:
         await self.expire_actions()
 
     async def expire_actions(self) -> None:
+        self.db.lock_expired_video_jobs()
         jobs = {
             (job.chat_id, job.message_id): job
             for job in self.db.video_widgets_to_refresh() + self.db.expired_video_widgets()
@@ -291,5 +327,5 @@ class VideoWorkflow:
             if key in self._active or job.state in BUSY_STATES or not self.access.allowed("group", job.chat_id):
                 continue
             await self.refresh_widget(*key)
-            if self.expired(job):
+            if job.result_locked or self.expired(job):
                 self._widget_locks.pop(key, None)

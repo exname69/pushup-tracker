@@ -32,7 +32,7 @@ class PrivateWorkflowTests(unittest.TestCase):
         self.access = Allowlist(users={123}, groups={-100})
         self.workflow = VideoWorkflow(
             None, self.db, self.access, ZoneInfo("UTC"),
-            asyncio.Semaphore(1), "gemini-fallback",
+            asyncio.Semaphore(1),
         )
         self.workflow.refresh_widget = AsyncMock()
         self.workflow._process = AsyncMock()

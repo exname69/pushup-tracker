@@ -41,6 +41,20 @@ class VideoWorkflow:
         self._active: set[tuple[int, int]] = set()
         self._widget_locks: dict[tuple[int, int], asyncio.Lock] = {}
 
+    def chat_allowed(self, chat_type: str, chat_id: int, user_id: int) -> bool:
+        """Проверять разрешения для групп и лички единообразно."""
+        if chat_type == "private":
+            return self.access.allowed("user", user_id)
+        if chat_type in ("group", "supergroup"):
+            return self.access.allowed("group", chat_id)
+        return False
+
+    def job_allowed(self, job: VideoJob) -> bool:
+        """Личный чат Telegram имеет chat_id == user_id."""
+        if job.chat_id > 0 and job.chat_id == job.user_id:
+            return self.access.allowed("user", job.user_id)
+        return self.access.allowed("group", job.chat_id)
+
     @staticmethod
     def expired(job: VideoJob) -> bool:
         return bool(
@@ -114,6 +128,8 @@ class VideoWorkflow:
 
     async def on_video(self, message: Message) -> None:
         if not message.from_user or message.from_user.is_bot or not message.video_note:
+            return
+        if not self.chat_allowed(message.chat.type, message.chat.id, message.from_user.id):
             return
         key = (message.chat.id, message.message_id)
         if self.db.has_video(*key) or self.db.get_video_job(*key):
@@ -213,8 +229,8 @@ class VideoWorkflow:
             await self._answer(query, "Карточка недоступна.", True)
             return
         chat_id = query.message.chat.id
-        if query.message.chat.type not in ("group", "supergroup") or not self.access.allowed("group", chat_id):
-            await self._answer(query, "В этой группе действие недоступно.", True)
+        if not self.chat_allowed(query.message.chat.type, chat_id, query.from_user.id):
+            await self._answer(query, "В этом чате действие недоступно.", True)
             return
         action, original_id = match.groups()
         message_id = int(original_id)
@@ -306,7 +322,7 @@ class VideoWorkflow:
                 job.chat_id, job.message_id, count=None,
                 error="Обработка прервалась при перезапуске бота.",
             )
-            if self.access.allowed("group", job.chat_id):
+            if self.job_allowed(job):
                 await self.refresh_widget(job.chat_id, job.message_id)
         # Обновить активные карточки предыдущей версии на Rich HTML после запуска.
         with self.db.conn:
@@ -324,7 +340,7 @@ class VideoWorkflow:
             for job in self.db.video_widgets_to_refresh() + self.db.expired_video_widgets()
         }
         for key, job in jobs.items():
-            if key in self._active or job.state in BUSY_STATES or not self.access.allowed("group", job.chat_id):
+            if key in self._active or job.state in BUSY_STATES or not self.job_allowed(job):
                 continue
             await self.refresh_widget(*key)
             if job.result_locked or self.expired(job):

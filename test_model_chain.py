@@ -13,7 +13,7 @@ from storage import Storage
 from tracker_core import setup_manual_storage
 from video_workflow import VideoWorkflow
 from vision import (
-    Analysis, PRIMARY_MODEL, SECONDARY_MODEL, WEAK_MODEL,
+    Analysis, PRIMARY_MODEL, SECONDARY_MODEL, FALLBACK_MODEL,
     INITIAL_MODEL_CHAIN, RETRY_MODEL_CHAIN, ModelOverloadedError,
 )
 
@@ -61,7 +61,7 @@ class ModelChainTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_model_order_is_fixed_in_python(self):
         self.assertEqual(
-            INITIAL_MODEL_CHAIN, (PRIMARY_MODEL, SECONDARY_MODEL, WEAK_MODEL),
+            INITIAL_MODEL_CHAIN, (PRIMARY_MODEL, SECONDARY_MODEL, FALLBACK_MODEL),
         )
         self.assertEqual(RETRY_MODEL_CHAIN, (PRIMARY_MODEL, SECONDARY_MODEL))
 
@@ -89,7 +89,7 @@ class ModelChainTests(unittest.IsolatedAsyncioTestCase):
         with patch("video_workflow.analyze_video", self.fake_analyzer({
             PRIMARY_MODEL: Analysis(repetitions=8, uncertain=True),
             SECONDARY_MODEL: ModelOverloadedError("overloaded"),
-            WEAK_MODEL: Analysis(repetitions=23),
+            FALLBACK_MODEL: Analysis(repetitions=23),
         })):
             await self.workflow._process(123, 50)
         self.assertEqual(self.called, list(INITIAL_MODEL_CHAIN))
@@ -101,7 +101,7 @@ class ModelChainTests(unittest.IsolatedAsyncioTestCase):
         with patch("video_workflow.analyze_video", self.fake_analyzer({
             PRIMARY_MODEL: None,
             SECONDARY_MODEL: None,
-            WEAK_MODEL: Analysis(repetitions=22),
+            FALLBACK_MODEL: Analysis(repetitions=22),
         })):
             await self.workflow._process(123, 50)
 
@@ -110,7 +110,7 @@ class ModelChainTests(unittest.IsolatedAsyncioTestCase):
         with patch("video_workflow.analyze_video", self.fake_analyzer({
             PRIMARY_MODEL: None,
             SECONDARY_MODEL: Analysis(repetitions=25),
-            WEAK_MODEL: Analysis(repetitions=99),
+            FALLBACK_MODEL: Analysis(repetitions=99),
         })):
             await self.workflow._process(123, 50)
         self.assertEqual(self.called, list(RETRY_MODEL_CHAIN))
@@ -121,7 +121,7 @@ class ModelChainTests(unittest.IsolatedAsyncioTestCase):
         with patch("video_workflow.analyze_video", self.fake_analyzer({
             PRIMARY_MODEL: None,
             SECONDARY_MODEL: None,
-            WEAK_MODEL: None,
+            FALLBACK_MODEL: None,
         })):
             await self.workflow._process(123, 50)
         self.assertEqual(self.called, list(INITIAL_MODEL_CHAIN))

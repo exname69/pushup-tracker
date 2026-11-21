@@ -207,6 +207,26 @@ def debug_text(
         f"Разрешённых групп: {len(access.list_allowed('group'))}",
         f"Пользователей с доступом к личке: {len(access.list_allowed('user'))}",
     ]
+    # Gemini не предоставляет здесь достоверные индивидуальные RPM/TPM/RPD.
+    # Показываем только измеренное ботом потребление, а не выдуманный потолок.
+    stats = db.model_request_stats(now)
+    lines += ["", "🤖 <b>Gemini: запросы и ограничения</b>"]
+    for model in INITIAL_MODEL_CHAIN:
+        windows = stats.get(model, {})
+        minute = windows.get("minute", (0,) * 7)
+        day = windows.get("day", (0,) * 7)
+        lines.extend([
+            f"<b>{html.escape(model)}</b>",
+            f"За 60 с: {minute[0]} запросов · успешных {minute[1]} · 429: {minute[2]} · 503/504: {minute[3]}",
+            f"За 24 ч: {day[0]} запросов · успешных {day[1]} · 429: {day[2]} · 503/504: {day[3]}",
+            f"Токены за 24 ч: вход {day[4]}, выход {day[5]}, всего {day[6]}",
+        ])
+    lines.append(
+        "Квоты RPM/TPM/RPD аккаунта не выдаются этим SDK. "
+        "Фактические лимиты смотри в Google AI Studio → Rate limits: "
+        "https://aistudio.google.com/app/plan_information"
+    )
+
     recent_rejections = db.conn.execute(
         """SELECT chat_id, user_id, rejected_count, created_at_utc
            FROM manual_rejections ORDER BY id DESC LIMIT 5"""

@@ -26,10 +26,10 @@ from tracker_core import (
     setup_manual_storage, today_text,
 )
 from video_workflow import VideoWorkflow
+from vision import INITIAL_MODEL_CHAIN
 
 log = logging.getLogger(__name__)
 MAX_DAILY_OVERRIDE = 100_000
-DEBUG_GEMINI_MODEL = "gemini-3.5-flash-lite"
 PUBLIC_COMMANDS = [
     BotCommand(command="start", description="Начать работу"),
     BotCommand(command="help", description="Все команды"),
@@ -192,9 +192,7 @@ def debug_text(
         f"до {MAX_MANUAL_VIDEOS_PER_DAY} кружочков/сутки, "
         f"{MAX_INVALID_MANUAL_ATTEMPTS} ошибки до блокировки, "
         f"{int(MANUAL_INPUT_TTL.total_seconds() / 60)} минут",
-        f"🤖 Gemini (группы): {html.escape(os.getenv('GEMINI_MODEL', DEBUG_GEMINI_MODEL))}",
-        f"🧪 Gemini (личка): основная {html.escape(os.getenv('GEMINI_MODEL', DEBUG_GEMINI_MODEL))}, "
-        f"резервная {html.escape(DEBUG_GEMINI_MODEL)}",
+        f"🤖 Gemini (личка и группы): {html.escape(' → '.join(INITIAL_MODEL_CHAIN))}",
         f"🔑 Gemini API: {'настроен' if os.getenv('GEMINI_API_KEY') else 'не настроен'}",
         f"📅 Следующий отчёт: {next_run.astimezone(tz):%Y-%m-%d %H:%M %Z}" if next_run else "📅 Следующий отчёт: не запланирован",
         "",
@@ -285,7 +283,7 @@ async def main() -> None:
         return report_text(day, daily_report_rows(db, chat_id, day, tz, daily_target), daily_target)
 
     async with Bot(token=token) as bot:
-        workflow = VideoWorkflow(bot, db, access, tz, semaphore, DEBUG_GEMINI_MODEL)
+        workflow = VideoWorkflow(bot, db, access, tz, semaphore)
         dp.callback_query.register(workflow.on_callback, F.data.startswith("video:"))
 
         async def publish_yesterday() -> None:

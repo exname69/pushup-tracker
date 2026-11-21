@@ -10,6 +10,8 @@ import logging
 import math
 import os
 import time
+
+import httpx
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -29,7 +31,12 @@ HYDROGEN_THINKING_LEVEL = "MEDIUM"
 
 
 class ModelOverloadedError(Exception):
-    """Gemini returned HTTP 503 (service overloaded)."""
+    """Временная недоступность Gemini: 408, 429, 5xx или ошибка сети."""
+
+    def __init__(self, model: str, status: int | None = None) -> None:
+        self.model = model
+        self.status = status
+        super().__init__(f"{model}: HTTP {status}" if status else f"{model}: network")
 
 
 @dataclass(frozen=True)
@@ -116,7 +123,12 @@ def analyze_video(
         # уже прекратил ожидание результата to_thread().
         with genai.Client(
             api_key=api_key,
-            http_options=types.HttpOptions(timeout=MODEL_HTTP_TIMEOUT_MS),
+            http_options=types.HttpOptions(
+                timeout=MODEL_HTTP_TIMEOUT_MS,
+                # Иначе SDK сам повторяет 503/504 и расходует общий таймаут;
+                # переход на другую модель контролируется video_workflow.
+                retry_options=types.HttpRetryOptions(attempts=1),
+            ),
         ) as client:
             response = client.models.generate_content(
                 model=model,
@@ -221,11 +233,19 @@ def analyze_video(
             api_seconds=api_seconds,
         )
     except errors.APIError as exc:
-        if exc.code == 503:
-            log.warning("Gemini: модель %s перегружена (HTTP 503)", model)
-            raise ModelOverloadedError(model) from exc
-        log.exception("Gemini API error: model=%s status=%s", model, exc.code)
+        status = getattr(exc, "code", None)
+        if isinstance(status, int) and (
+            status in (408, 429) or 500 <= status <= 599
+        ):
+            log.warning("Gemini временно недоступен: model=%s HTTP %s", model, status)
+            raise ModelOverloadedError(model, status=status) from exc
+        log.error("Gemini API error: model=%s HTTP %s: %s", model, status, exc)
         return None
+    except (TimeoutError, ConnectionError, httpx.TransportError) as exc:
+        log.warning(
+            "Gemini: ошибка сети model=%s (%s)", model, type(exc).__name__,
+        )
+        raise ModelOverloadedError(model) from exc
     except Exception:
         log.exception("Gemini: ошибка анализа видео")
         return None

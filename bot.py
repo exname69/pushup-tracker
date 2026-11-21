@@ -338,6 +338,10 @@ async def main() -> None:
                     "DELETE FROM manual_rejections WHERE created_at_utc<?",
                     (history_threshold,),
                 )
+                db.conn.execute(
+                    "DELETE FROM model_requests WHERE requested_at_utc<?",
+                    ((now - timedelta(days=30)).isoformat(),),
+                )
 
         @dp.my_chat_member()
         async def on_bot_membership(event: ChatMemberUpdated) -> None:

@@ -4,7 +4,6 @@ from __future__ import annotations
 import asyncio
 import html
 import logging
-import os
 import re
 import time
 import tempfile
@@ -22,7 +21,10 @@ from storage import Storage, VideoJob, VIDEO_PROCESS_TIMEOUT_SECONDS, video_acti
 from tracker_core import (
     MAX_INVALID_MANUAL_ATTEMPTS, MAX_MANUAL_VIDEOS_PER_DAY, create_pending_manual,
 )
-from vision import MAX_VIDEO_BYTES, ModelOverloadedError, analyze_video
+from vision import (
+    INITIAL_MODEL_CHAIN, RETRY_MODEL_CHAIN, WEAK_MODEL,
+    MAX_VIDEO_BYTES, ModelOverloadedError, analyze_video,
+)
 
 log = logging.getLogger(__name__)
 BUSY_STATES = {"queued", "downloading", "analyzing"}
@@ -31,14 +33,13 @@ BUSY_STATES = {"queued", "downloading", "analyzing"}
 class VideoWorkflow:
     def __init__(
         self, bot: Bot, db: Storage, access, tz: ZoneInfo,
-        semaphore: asyncio.Semaphore, fallback_model: str,
+        semaphore: asyncio.Semaphore,
     ) -> None:
         self.bot = bot
         self.db = db
         self.access = access
         self.tz = tz
         self.semaphore = semaphore
-        self.fallback_model = fallback_model
         self._active: set[tuple[int, int]] = set()
         self._widget_locks: dict[tuple[int, int], asyncio.Lock] = {}
 
@@ -208,41 +209,36 @@ class VideoWorkflow:
                             self.db.set_video_job_state(*key, "analyzing")
                             await self.refresh_widget(*key)
 
-                            # Каждая попытка начинается с сильной модели.
-                            # Резервную вызываем только при первичном анализе.
-                            try:
-                                primary = await asyncio.to_thread(
-                                    analyze_video, target, duration_seconds=job.duration,
-                                )
-                            except ModelOverloadedError:
-                                primary = None
-                                log.warning("Основная модель перегружена chat=%s msg=%s", *key)
-
-                            if primary is not None and not primary.uncertain:
-                                analysis = primary
-                                source = "strong"
-                            elif not is_retry:
-                                primary_name = os.getenv(
-                                    "GEMINI_MODEL", "gemini-3.5-flash-lite"
-                                ).strip()
-                                if primary_name != self.fallback_model:
+                            # На первом анализе три модели по очереди.
+                            # При повторе — только две сильные модели.
+                            for index, model in enumerate(
+                                RETRY_MODEL_CHAIN if is_retry else INITIAL_MODEL_CHAIN
+                            ):
+                                if index:
                                     await self.refresh_widget(
-                                        *key, note="Пробую резервную модель…",
+                                        *key,
+                                        note=f"Пробую резервную модель {index + 1}…",
                                     )
-                                    try:
-                                        fallback = await asyncio.to_thread(
-                                            analyze_video, target,
-                                            duration_seconds=job.duration,
-                                            model_override=self.fallback_model,
-                                        )
-                                    except ModelOverloadedError:
-                                        fallback = None
-                                        log.warning(
-                                            "Резервная модель перегружена chat=%s msg=%s", *key
-                                        )
-                                    if fallback is not None and not fallback.uncertain:
-                                        analysis = fallback
-                                        source = "weak"
+                                log.info(
+                                    "Gemini: пробую model=%s chat=%s msg=%s retry=%s",
+                                    model, *key, is_retry,
+                                )
+                                try:
+                                    candidate = await asyncio.to_thread(
+                                        analyze_video, target, duration_seconds=job.duration,
+                                        model_override=model,
+                                    )
+                                except ModelOverloadedError:
+                                    candidate = None
+                                    log.warning(
+                                        "Gemini: перегружена model=%s chat=%s msg=%s",
+                                        model, *key,
+                                    )
+
+                                if candidate is not None and not candidate.uncertain:
+                                    analysis = candidate
+                                    source = "weak" if model == WEAK_MODEL else "strong"
+                                    break
         except TimeoutError:
             error = "⏱ Время обработки истекло (2 минуты). Можно повторить анализ."
             log.warning("Превышен общий таймаут обработки chat=%s msg=%s", *key)

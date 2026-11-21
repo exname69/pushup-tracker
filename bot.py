@@ -8,8 +8,6 @@ import os
 import re
 import sqlite3
 import sys
-import tempfile
-import time
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -27,11 +25,9 @@ from tracker_core import (
     help_text, manual_input_error_message, owner_private, penalty_target, process_manual_reply, report_text,
     setup_manual_storage, today_text,
 )
-from vision import analyze_video
 from video_workflow import VideoWorkflow
 
 log = logging.getLogger(__name__)
-MAX_DOWNLOAD_BYTES = 20 * 1024 * 1024
 MAX_DAILY_OVERRIDE = 100_000
 DEBUG_GEMINI_MODEL = "gemini-3.5-flash-lite"
 PUBLIC_COMMANDS = [
@@ -197,7 +193,8 @@ def debug_text(
         f"{MAX_INVALID_MANUAL_ATTEMPTS} ошибки до блокировки, "
         f"{int(MANUAL_INPUT_TTL.total_seconds() / 60)} минут",
         f"🤖 Gemini (группы): {html.escape(os.getenv('GEMINI_MODEL', DEBUG_GEMINI_MODEL))}",
-        f"🧪 Gemini (личка): {html.escape(DEBUG_GEMINI_MODEL)}",
+        f"🧪 Gemini (личка): основная {html.escape(os.getenv('GEMINI_MODEL', DEBUG_GEMINI_MODEL))}, "
+        f"резервная {html.escape(DEBUG_GEMINI_MODEL)}",
         f"🔑 Gemini API: {'настроен' if os.getenv('GEMINI_API_KEY') else 'не настроен'}",
         f"📅 Следующий отчёт: {next_run.astimezone(tz):%Y-%m-%d %H:%M %Z}" if next_run else "📅 Следующий отчёт: не запланирован",
         "",
@@ -611,116 +608,20 @@ async def main() -> None:
             elif result.status == "accepted":
                 if result.video_message_id is not None:
                     await workflow.refresh_widget(message.chat.id, result.video_message_id)
-                await message.reply(
-                    f"✍️ <b>{html.escape(result.name)}</b>: <b>{result.count}</b> отжиманий — "
-                    "указано вручную, можно перепроверить по видео.",
-                    parse_mode="HTML",
-                )
+                # В личке достаточно обновить ту же Rich-карточку, без второго
+                # бот-сообщения с результатом.
+                if message.chat.type != "private":
+                    await message.reply(
+                        f"✍️ <b>{html.escape(result.name)}</b>: <b>{result.count}</b> отжиманий — "
+                        "указано вручную, результат зафиксирован.",
+                        parse_mode="HTML",
+                    )
 
         @dp.message(F.video_note)
         async def on_video_note(message: Message) -> None:
-            if message.chat.type == "private":
-                # Диагностика видео в личке: не сохраняет статистику и не просит ручной ввод.
-                note = message.video_note
-                details = [
-                    "🔎 <b>Gemini: диагностика видео</b>",
-                    f"🧠 Модель отладки: <code>{DEBUG_GEMINI_MODEL}</code>",
-                    f"🎬 Длительность видео: {note.duration} с",
-                    (f"💾 Размер: {note.file_size / (1024 * 1024):.2f} МБ"
-                     if note.file_size is not None else "💾 Размер: неизвестен"),
-                    f"📦 Локальный лимит файла: {MAX_DOWNLOAD_BYTES / (1024 * 1024):.0f} МБ",
-                    "🌐 Таймаут скачивания: 90 с",
-                    "🧵 Одновременно анализируется до 2 видео",
-                ]
-                if note.file_size and note.file_size > MAX_DOWNLOAD_BYTES:
-                    details += ["❌ Файл превышает локальный лимит — анализ не выполнялся.",
-                                "🧪 Результат не записан в статистику."]
-                    await message.answer("\n".join(details), parse_mode="HTML")
-                    return
-                started = time.perf_counter()
-                queue_seconds = download_seconds = analysis_seconds = None
-                phase = "ожидание свободного слота"
-                analysis = error = None
-                try:
-                    async with semaphore:
-                        queue_seconds = time.perf_counter() - started
-                        with tempfile.TemporaryDirectory(prefix="pushup-debug-") as tempdir:
-                            target = Path(tempdir) / "note.mp4"
-                            phase = "скачивание из Telegram"
-                            download_started = time.perf_counter()
-                            try:
-                                await bot.download(note.file_id, destination=target, timeout=90)
-                            finally:
-                                download_seconds = time.perf_counter() - download_started
-                            phase = "анализ Gemini"
-                            analysis_started = time.perf_counter()
-                            try:
-                                analysis = await asyncio.to_thread(
-                                    analyze_video, target, duration_seconds=note.duration,
-                                    model_override=DEBUG_GEMINI_MODEL,
-                                )
-                            finally:
-                                analysis_seconds = time.perf_counter() - analysis_started
-                except Exception as exc:
-                    error = exc
-                    log.exception("Ошибка debug-анализа кружочка user=%s phase=%s",
-                                  message.from_user.id if message.from_user else "unknown", phase)
-                details.append("\n⏱ <b>Замеры времени</b>")
-                if queue_seconds is not None:
-                    details.append(f"⏳ Ожидание слота: {queue_seconds:.2f} с")
-                if download_seconds is not None:
-                    details.append(f"📥 Скачивание: {download_seconds:.2f} с")
-                if analysis_seconds is not None:
-                    details.append(f"🤖 Анализ Gemini: {analysis_seconds:.2f} с")
-                details.append(f"🕒 Всего: {time.perf_counter() - started:.2f} с")
-                if error is not None:
-                    details.append(f"❌ Ошибка на этапе «{phase}» ({type(error).__name__}). Подробности — в логах.")
-                elif analysis is None:
-                    details.append("⚠️ Анализатор не вернул надёжный результат.")
-                else:
-                    details.append("\n💪 <b>Результат</b>")
-                    details.append(f"Отжиманий: <b>{analysis.repetitions}</b>")
-                    details.append(f"Неопределённость: {'⚠️ да' if analysis.uncertain else '✅ нет'}")
-                    timestamps = analysis.completed_at_seconds
-                    details.append(
-                        "Моменты завершения: " + (
-                            ", ".join(f"{timestamp:g} с" for timestamp in timestamps[:100])
-                            + (f" …и ещё {len(timestamps) - 100}" if len(timestamps) > 100 else "")
-                            if timestamps else "нет"
-                        )
-                    )
-                    if analysis.requested_fps is not None:
-                        details.append(f"🎞 Заданная частота выборки видео: {analysis.requested_fps} FPS")
-                    if analysis.api_seconds is not None:
-                        details.append(f"⚙️ Вызов Gemini API: {analysis.api_seconds:.2f} с")
-                    details.append(
-                        "⚠️ Gemini сообщил о неопределённости: результат не подтверждён."
-                        if analysis.uncertain else "✅ Ответ анализатора получен."
-                    )
-                    details.append("\n🔢 <b>Использование токенов</b>")
-                    usage = analysis.usage_metadata
-                    token_fields = (
-                        ("Вход", "prompt_token_count"),
-                        ("Выход", "candidates_token_count"),
-                        ("Thinking", "thoughts_token_count"),
-                        ("Из кеша", "cached_content_token_count"),
-                        ("Всего", "total_token_count"),
-                    )
-                    if usage:
-                        for label, key in token_fields:
-                            value = usage.get(key)
-                            if value is not None:
-                                details.append(f"{label}: {value:,}".replace(",", " "))
-                    else:
-                        details.append("Метаданные токенов не предоставлены Gemini API.")
-                    if analysis.model:
-                        details.append(f"🧠 Модель: {html.escape(analysis.model)}")
-                    if analysis.finish_reason:
-                        details.append(f"🛑 Причина завершения: {html.escape(analysis.finish_reason)}")
-                details.append("🧪 Тестовый режим: результат не записан в статистику.")
-                await message.answer("\n".join(details), parse_mode="HTML")
-                return
-            if message.chat.type not in ("group", "supergroup"):
+            # Личка и группы используют одинаковую обновляемую карточку.
+            # В личке больше нет отдельного диагностического сообщения.
+            if message.chat.type not in ("private", "group", "supergroup"):
                 return
             await workflow.on_video(message)
 

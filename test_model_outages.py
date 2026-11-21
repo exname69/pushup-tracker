@@ -14,7 +14,7 @@ from tracker_core import setup_manual_storage
 from video_workflow import VideoWorkflow
 from vision import (
     Analysis, INITIAL_MODEL_CHAIN, RETRY_MODEL_CHAIN,
-    ModelOverloadedError, PRIMARY_MODEL, SECONDARY_MODEL, WEAK_MODEL,
+    ModelOverloadedError, PRIMARY_MODEL, SECONDARY_MODEL, FALLBACK_MODEL,
 )
 
 
@@ -91,13 +91,13 @@ class OutageTests(unittest.IsolatedAsyncioTestCase):
         with patch("video_workflow.analyze_video", self.analyzer({
             PRIMARY_MODEL: ModelOverloadedError(PRIMARY_MODEL, 429),
             SECONDARY_MODEL: ModelOverloadedError(SECONDARY_MODEL, 503),
-            WEAK_MODEL: ModelOverloadedError(WEAK_MODEL, 504),
+            FALLBACK_MODEL: ModelOverloadedError(FALLBACK_MODEL, 504),
         })):
             await self.flow._process(123, 50)
         stats = self.db.model_request_stats()
         self.assertEqual(stats[PRIMARY_MODEL]["day"][2], 1)
         self.assertEqual(stats[SECONDARY_MODEL]["day"][3], 1)
-        self.assertEqual(stats[WEAK_MODEL]["day"][3], 1)
+        self.assertEqual(stats[FALLBACK_MODEL]["day"][3], 1)
         self.assertEqual(self.db.get_video_job(123, 50).retry_used, 0)
 
     async def test_token_counters_per_model(self):

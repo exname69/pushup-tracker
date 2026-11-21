@@ -135,7 +135,9 @@ class VideoWorkflow:
         if self.db.has_video(*key) or self.db.get_video_job(*key):
             return
         note = message.video_note
-        self.db.register_chat(message.chat.id, message.chat.title or "Группа")
+        # Отчёты по группам не должны включать личные диалоги.
+        if message.chat.type in ("group", "supergroup"):
+            self.db.register_chat(message.chat.id, message.chat.title or "Группа")
         self.db.create_video_job(
             *key, message.from_user.id, message.from_user.full_name,
             note.file_id, note.duration, note.file_size, message.date,

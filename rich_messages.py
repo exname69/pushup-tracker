@@ -90,8 +90,12 @@ def render_video_card(
         # В storage поле имеет суффикс _utc: считаем naive-значение временем UTC.
         deadline = deadline.replace(tzinfo=timezone.utc)
 
-    actions_open = bool(terminal and deadline is not None and now < deadline)
-    expired = bool(terminal and deadline is not None and now >= deadline)
+    expired = bool(job.actions_closed or (deadline is not None and now >= deadline))
+    if expired:
+        summary = f"💪 Отжимания: <strong>{result[0]}</strong>" if result is not None else "💪 Отжимания: не засчитано"
+        return InputRichMessage(html=f"<p>{summary}</p>"), False
+    actions_open = terminal
+    manual_open = actions_open and job.completed_attempts >= 2 and deadline is not None
 
     # Компактная карточка с индикатором активности, без фиктивных процентов.
     lines = [
@@ -114,13 +118,15 @@ def render_video_card(
     if job.state == "failed":
         error = job.error or "Не удалось распознать отжимания."
         lines.append(f"<footer>{html.escape(error)}</footer>")
+        if job.completed_attempts < 2:
+            lines.append("<footer>Повтори анализ, чтобы открыть ручной ввод.</footer>")
 
     if note:
         lines.append(f"<footer>{html.escape(note)}</footer>")
 
     if actions_open:
         lines.append('<tg-button-row align="left">')
-        if job.attempt_completed:
+        if manual_open:
             label = "Ввести вручную" if result is None else "Изменить"
             lines.append(
                 '<tg-button type="callback_data" style="primary" '
@@ -130,9 +136,8 @@ def render_video_card(
             '<tg-button type="callback_data" '
             f'data="video:retry:{job.message_id}">🔄 Повторить</tg-button>',
             "</tg-button-row>",
-            f"<footer>Доступно до {deadline.astimezone(tz):%d.%m %H:%M}</footer>",
         ])
-    elif expired:
-        lines.append("<footer>🔒 Время изменения результата истекло</footer>")
+        if deadline is not None:
+            lines.append(f"<footer>Доступно до {deadline.astimezone(tz):%d.%m %H:%M}</footer>")
 
     return InputRichMessage(html="\n".join(lines)), actions_open

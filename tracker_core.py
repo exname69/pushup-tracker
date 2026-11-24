@@ -163,8 +163,12 @@ def process_manual_reply(
     if sender_id != author_id:
         return ManualReplyResult("forbidden", video_message_id=original_id)
     job = db.get_video_job(chat_id, original_id)
+    if job is not None and not job.actions_closed and job.completed_attempts < 2 and (
+        job.action_expires_at_utc is None or not is_manual_expired(job.action_expires_at_utc, now)
+    ):
+        return ManualReplyResult("busy", video_message_id=original_id)
     if is_manual_expired(expires_at, now) or (
-        job is not None and is_manual_expired(job.action_expires_at_utc, now)
+        job is not None and (job.actions_closed or is_manual_expired(job.action_expires_at_utc, now))
     ):
         with db.conn:
             db.conn.execute(
@@ -173,7 +177,7 @@ def process_manual_reply(
             )
         return ManualReplyResult("expired", video_message_id=original_id)
     if job is not None and (
-        job.state not in ("done", "failed") or not job.attempt_completed
+        job.state not in ("done", "failed") or job.completed_attempts < 2
     ):
         return ManualReplyResult("busy", video_message_id=original_id)
     if invalid_attempts >= MAX_INVALID_MANUAL_ATTEMPTS:
@@ -240,7 +244,7 @@ def process_manual_reply(
     if job is not None:
         inserted = db.replace_video_result(chat_id, original_id, count, is_manual=True)
         if inserted:
-            db.finish_video_job(chat_id, original_id, 'done', now=now)
+            db.finish_video_job(chat_id, original_id, 'done', now=now, attempt_completed=False)
     else:
         inserted = db.save_video(chat_id, original_id, author_id, name, count, video_time)
     with db.conn:
@@ -365,8 +369,8 @@ def help_text() -> str:
         "/rules — правила челленджа\n"
         "/myid — твой Telegram ID (в личке)\n\n"
         "Отправь видеокружочек с отжиманиями. Под ним появится карточка обработки. "
-        "В течение 30 минут после первого результата или ошибки можно изменить "
-        "число вручную или повторить анализ кнопками. "
+        "После первого успешного анализа или второй завершённой попытки есть 15 минут на изменения. "
+        "Если первый анализ не удался, повтори его без ограничения по времени. Ручной ввод доступен после второго анализа. "
         f"Ручной ввод: не более {MAX_MANUAL_VIDEOS_PER_DAY} разных кружочков в сутки."
     )
 

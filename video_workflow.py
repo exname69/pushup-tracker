@@ -45,8 +45,10 @@ class VideoWorkflow:
     @staticmethod
     def expired(job: VideoJob) -> bool:
         return bool(
-            job.action_expires_at_utc
-            and datetime.now(timezone.utc) >= datetime.fromisoformat(job.action_expires_at_utc)
+            job.actions_closed or (
+                job.action_expires_at_utc
+                and datetime.now(timezone.utc) >= datetime.fromisoformat(job.action_expires_at_utc)
+            )
         )
 
     async def refresh_widget(
@@ -67,8 +69,13 @@ class VideoWorkflow:
                 ):
                     return
                 result = self.db.get_video_result(*key)
+                rendered_at = datetime.now(timezone.utc)
+                locked = bool(job.actions_closed or (
+                    job.action_expires_at_utc
+                    and rendered_at >= datetime.fromisoformat(job.action_expires_at_utc)
+                ))
                 content, actions_open = render_video_card(
-                    job, result, self.tz, note, progress_frame=progress_frame or 0,
+                    job, result, self.tz, note, now=rendered_at, progress_frame=progress_frame or 0,
                 )
                 try:
                     if job.widget_message_id is None:
@@ -83,7 +90,7 @@ class VideoWorkflow:
                             chat_id=chat_id, message_id=job.widget_message_id,
                             rich_message=content,
                         ))
-                    self._mark_rendered(job, result, actions_open)
+                    self._mark_rendered(job, result, actions_open, locked)
                     return
                 except TelegramRetryAfter as exc:
                     if progress_frame is not None:
@@ -95,7 +102,7 @@ class VideoWorkflow:
                     log.warning("Не удалось обновить карточку: flood control chat=%s msg=%s", *key)
                 except TelegramBadRequest as exc:
                     if "message is not modified" in str(exc).lower():
-                        self._mark_rendered(job, result, actions_open)
+                        self._mark_rendered(job, result, actions_open, locked)
                         return
                     if job.widget_message_id is not None and any(
                         reason in str(exc).lower()
@@ -108,19 +115,19 @@ class VideoWorkflow:
                     log.exception("Не удалось обновить карточку chat=%s msg=%s", *key)
                 return
 
-    def _mark_rendered(self, job: VideoJob, result, actions_open: bool) -> None:
+    def _mark_rendered(self, job: VideoJob, result, actions_open: bool, locked: bool) -> None:
         key = (job.chat_id, job.message_id)
         current = self.db.get_video_job(*key)
         if current is None:
             return
         # Ручной ответ мог изменить результат, пока Telegram принимал editMessageText.
         if (current.state, current.error, current.action_expires_at_utc,
-            current.attempt_completed, self.db.get_video_result(*key)) != (
-            job.state, job.error, job.action_expires_at_utc, job.attempt_completed, result,
+            current.completed_attempts, self.db.get_video_result(*key)) != (
+            job.state, job.error, job.action_expires_at_utc, job.completed_attempts, result,
         ):
             return
         self.db.mark_video_widget_clean(*key)
-        if not actions_open and self.expired(job) and job.state not in BUSY_STATES:
+        if locked and not actions_open:
             self.db.mark_video_actions_closed(*key)
 
     async def on_video(self, message: Message) -> None:
@@ -149,7 +156,7 @@ class VideoWorkflow:
         while True:
             await asyncio.sleep(delay)
             job = self.db.get_video_job(*key)
-            if job is None or job.state not in BUSY_STATES:
+            if job is None or job.state not in BUSY_STATES or self.expired(job):
                 return
             if job.state == "queued":
                 continue
@@ -183,10 +190,10 @@ class VideoWorkflow:
         if job is None:
             return
         analysis = None
-        error = "Не удалось уверенно распознать отжимания. Можно указать число вручную или повторить анализ."
+        error = "Не удалось уверенно распознать отжимания."
         try:
             if job.file_size and job.file_size > MAX_VIDEO_BYTES:
-                error = "Кружочек превышает лимит скачивания (20 МБ). Можно указать число вручную."
+                error = "Кружочек превышает лимит скачивания (20 МБ)."
             else:
                 async with self.semaphore:
                     self.db.set_video_job_state(*key, "downloading")
@@ -214,7 +221,14 @@ class VideoWorkflow:
                                     log.warning("Резервная модель перегружена chat=%s msg=%s", *key)
         except Exception:
             log.exception("Ошибка обработки кружочка chat=%s msg=%s", *key)
-            error = "Не удалось обработать видео. Можно указать число вручную или повторить анализ."
+            error = "Не удалось обработать видео."
+        # A retry finishing after the fixed deadline must not change the count.
+        if self.expired(job):
+            previous = self.db.get_video_result(*key)
+            self.db.finish_video_job(
+                *key, "done" if previous is not None else "failed", attempt_completed=False,
+            )
+            return
         if analysis is not None and not analysis.uncertain:
             self.db.replace_video_result(*key, analysis.repetitions)
             self.db.finish_video_job(*key, "done")
@@ -251,14 +265,14 @@ class VideoWorkflow:
             await self._answer(query, "Изменить результат может только автор кружочка.", True)
             return
         if self.expired(job):
-            await self._answer(query, "Прошло 30 минут. Изменения больше недоступны.", True)
+            await self._answer(query, "Время изменения истекло. Результат заблокирован.", True)
             await self.refresh_widget(*key)
             return
-        if key in self._active or job.state in BUSY_STATES or not job.action_expires_at_utc:
+        if key in self._active or job.state not in ("done", "failed"):
             await self._answer(query, "Этот кружочек уже обрабатывается. Дождись результата.")
             return
-        if action == "manual" and not job.attempt_completed:
-            await self._answer(query, "Сначала запусти обработку кружочка и дождись результата.", True)
+        if action == "manual" and (job.completed_attempts < 2 or not job.action_expires_at_utc):
+            await self._answer(query, "Сначала повтори анализ кружочка и дождись результата.", True)
             return
         self._active.add(key)
         try:
@@ -276,11 +290,20 @@ class VideoWorkflow:
     async def _ask_manual(self, query: CallbackQuery, job: VideoJob) -> None:
         key = (job.chat_id, job.message_id)
         pending = self.db.conn.execute(
-            "SELECT prompt_message_id, invalid_attempts FROM pending_manual WHERE chat_id=? AND video_message_id=?", key,
+            "SELECT prompt_message_id, invalid_attempts, expires_at_utc FROM pending_manual WHERE chat_id=? AND video_message_id=?", key,
         ).fetchone()
         if pending and pending[1] >= MAX_INVALID_MANUAL_ATTEMPTS:
             await self._answer(query, "Ручной ввод заблокирован после трёх ошибок. Можно повторить анализ.", True)
             return
+        if pending and pending[2] != job.action_expires_at_utc:
+            # A legacy manual prompt may predate the new retry gate.
+            with self.db.conn:
+                self.db.conn.execute(
+                    "UPDATE pending_manual SET expires_at_utc=?, prompt_message_id=NULL "
+                    "WHERE chat_id=? AND video_message_id=?",
+                    (job.action_expires_at_utc, *key),
+                )
+            pending = None
         if pending and pending[0] is not None:
             await self._answer(query, "Запрос уже отправлен. Ответь числом на него или на исходный кружочек.", True)
             return
@@ -339,8 +362,11 @@ class VideoWorkflow:
             for job in self.db.video_widgets_to_refresh() + self.db.expired_video_widgets()
         }
         for key, job in jobs.items():
-            if key in self._active or job.state in BUSY_STATES or not self.access.allowed("group", job.chat_id):
+            if not self.access.allowed("group", job.chat_id):
+                continue
+            busy = key in self._active or job.state in BUSY_STATES
+            if busy and not self.expired(job):
                 continue
             await self.refresh_widget(*key)
-            if self.expired(job):
+            if not busy and self.expired(job):
                 self._widget_locks.pop(key, None)

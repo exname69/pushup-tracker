@@ -8,7 +8,7 @@ from datetime import date, datetime, time, timedelta, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
-VIDEO_ACTION_TTL = timedelta(minutes=30)
+VIDEO_ACTION_TTL = timedelta(minutes=15)
 
 
 @dataclass(frozen=True)
@@ -28,12 +28,13 @@ class VideoJob:
     message_thread_id: int | None = None
     actions_closed: bool = False
     attempt_completed: bool = False
+    completed_attempts: int = 0
 
 
 _VIDEO_JOB_COLUMNS = (
     "chat_id, message_id, user_id, display_name, file_id, duration, file_size, "
     "sent_at_utc, widget_message_id, state, action_expires_at_utc, error, "
-    "message_thread_id, actions_closed, attempt_completed"
+    "message_thread_id, actions_closed, attempt_completed, completed_attempts"
 )
 
 
@@ -83,6 +84,7 @@ class Storage:
                 actions_closed INTEGER NOT NULL DEFAULT 0,
                 widget_dirty INTEGER NOT NULL DEFAULT 1,
                 attempt_completed INTEGER NOT NULL DEFAULT 0,
+                completed_attempts INTEGER NOT NULL DEFAULT 0,
                 PRIMARY KEY (chat_id, message_id)
             );
             CREATE INDEX IF NOT EXISTS ix_video_jobs_expiry
@@ -120,6 +122,26 @@ class Storage:
                 self.conn.execute(
                     "UPDATE video_jobs SET attempt_completed=1 WHERE action_expires_at_utc IS NOT NULL"
                 )
+            if "completed_attempts" not in columns:
+                self.conn.execute(
+                    "ALTER TABLE video_jobs ADD COLUMN completed_attempts INTEGER NOT NULL DEFAULT 0"
+                )
+                # The old schema cannot distinguish a first attempt from a retry.
+                self.conn.execute("UPDATE video_jobs SET completed_attempts=attempt_completed")
+                for chat_id, message_id, raw_deadline, has_result in self.conn.execute(
+                    """SELECT j.chat_id, j.message_id, j.action_expires_at_utc,
+                              EXISTS(SELECT 1 FROM video_counts c WHERE c.chat_id=j.chat_id AND c.message_id=j.message_id)
+                       FROM video_jobs j WHERE j.actions_closed=0 AND j.action_expires_at_utc IS NOT NULL"""
+                ).fetchall():
+                    deadline = (
+                        (datetime.fromisoformat(raw_deadline) - timedelta(minutes=15)).isoformat()
+                        if has_result else None
+                    )
+                    self.conn.execute(
+                        "UPDATE video_jobs SET action_expires_at_utc=?, widget_dirty=1 "
+                        "WHERE chat_id=? AND message_id=?",
+                        (deadline, chat_id, message_id),
+                    )
 
     def register_chat(self, chat_id: int, title: str) -> None:
         now = datetime.now(timezone.utc).isoformat()
@@ -209,7 +231,7 @@ class Storage:
             f"SELECT {_VIDEO_JOB_COLUMNS} FROM video_jobs WHERE chat_id=? AND message_id=?",
             (chat_id, message_id),
         ).fetchone()
-        return VideoJob(*row[:-2], bool(row[-2]), bool(row[-1])) if row else None
+        return VideoJob(*row[:-3], bool(row[-3]), bool(row[-2]), row[-1]) if row else None
 
     def bind_video_widget(self, chat_id: int, message_id: int, widget_message_id: int | None) -> None:
         with self.conn:
@@ -233,23 +255,26 @@ class Storage:
         now = now or datetime.now(timezone.utc)
         if now.tzinfo is None:
             raise ValueError("now должен содержать timezone")
-        deadline = (now.astimezone(timezone.utc) + VIDEO_ACTION_TTL).isoformat()
+        job = self.get_video_job(chat_id, message_id)
+        if job is None:
+            return
+        attempts = job.completed_attempts + int(attempt_completed)
+        deadline = job.action_expires_at_utc
+        # A first failure stays retryable indefinitely. The window starts on
+        # the first success or second completed attempt, whichever comes first.
+        if deadline is None and attempt_completed and (state == "done" or attempts >= 2):
+            deadline = (now.astimezone(timezone.utc) + VIDEO_ACTION_TTL).isoformat()
         with self.conn:
             self.conn.execute(
                 """UPDATE video_jobs SET state=?, error=?, widget_dirty=1,
-                       action_expires_at_utc=CASE
-                           WHEN attempt_completed=0 AND ? THEN ?
-                           ELSE COALESCE(action_expires_at_utc, ?) END,
-                       actions_closed=CASE WHEN attempt_completed=0 AND ? THEN 0 ELSE actions_closed END,
-                       attempt_completed=MAX(attempt_completed, ?)
+                       action_expires_at_utc=?, attempt_completed=?, completed_attempts=?
                    WHERE chat_id=? AND message_id=?""",
-                (state, error, attempt_completed, deadline, deadline,
-                 attempt_completed, attempt_completed, chat_id, message_id),
+                (state, error, deadline, int(attempts > 0), attempts, chat_id, message_id),
             )
 
     def video_jobs_to_recover(self) -> list[VideoJob]:
         return [
-            VideoJob(*row[:-2], bool(row[-2]), bool(row[-1]))
+            VideoJob(*row[:-3], bool(row[-3]), bool(row[-2]), row[-1])
             for row in self.conn.execute(
                 f"SELECT {_VIDEO_JOB_COLUMNS} FROM video_jobs "
                 "WHERE state IN ('queued', 'downloading', 'analyzing')"
@@ -258,7 +283,7 @@ class Storage:
 
     def video_widgets_to_refresh(self) -> list[VideoJob]:
         return [
-            VideoJob(*row[:-2], bool(row[-2]), bool(row[-1]))
+            VideoJob(*row[:-3], bool(row[-3]), bool(row[-2]), row[-1])
             for row in self.conn.execute(
                 f"SELECT {_VIDEO_JOB_COLUMNS} FROM video_jobs WHERE widget_dirty=1"
             )
@@ -276,7 +301,7 @@ class Storage:
         if now.tzinfo is None:
             raise ValueError("now должен содержать timezone")
         return [
-            VideoJob(*row[:-2], bool(row[-2]), bool(row[-1]))
+            VideoJob(*row[:-3], bool(row[-3]), bool(row[-2]), row[-1])
             for row in self.conn.execute(
                 f"SELECT {_VIDEO_JOB_COLUMNS} FROM video_jobs "
                 "WHERE actions_closed=0 AND widget_message_id IS NOT NULL "

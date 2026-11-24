@@ -392,8 +392,8 @@ async def main() -> None:
                 db.register_chat(message.chat.id, message.chat.title or "Группа")
             await message.answer(
                 "🏋️ Пришлите видеокружочек с отжиманиями. Я посчитаю повторы.\n"
-                "Результат можно изменить вручную или пересчитать "
-                "в течение 30 минут после первого результата или ошибки.\n"
+                "После первого успешного анализа или второй завершённой попытки есть 15 минут на изменения.\n"
+                "Если первый анализ не удался, повтори его без ограничения по времени. Ручной ввод доступен после повторного анализа.\n"
                 f"Ручной ввод: до {MAX_MANUAL_VIDEOS_PER_DAY} разных кружочков в сутки.\n"
                 "Под кружочком появятся статус обработки и кнопки изменения результата и повторного анализа.\n"
                 f"Дневная норма: {daily_target}. Отчёт — в 00:00 ({tz.key}).\n"
@@ -592,7 +592,7 @@ async def main() -> None:
             elif result.status == "expired":
                 await message.reply("⌛ Время ручного изменения истекло. Обратись к владельцу.")
             elif result.status == "busy":
-                await message.reply("⏳ Кружочек сейчас обрабатывается. Дождись результата и повтори ввод.")
+                await message.reply("⏳ Ручной ввод доступен после завершения повторного анализа и только когда анализ не выполняется.")
             elif result.status in ("invalid", "too_large"):
                 # Не сообщаем участнику порог и не различаем ошибки формата и превышение.
                 # Внутренняя причина и подозрительное значение остаются в журнале владельца.
@@ -730,7 +730,7 @@ async def main() -> None:
         )
         scheduler.add_job(purge_old_pending, "interval", hours=1,
                           id="clean_manual_pending", max_instances=1, coalesce=True)
-        scheduler.add_job(workflow.expire_actions, "interval", minutes=1,
+        scheduler.add_job(workflow.expire_actions, "interval", seconds=10,
                           id="close_video_actions", max_instances=1, coalesce=True)
         scheduler.start()
         try:

@@ -27,6 +27,8 @@ from vision import MAX_VIDEO_BYTES, ModelOverloadedError, analyze_video
 log = logging.getLogger(__name__)
 BUSY_STATES = {"queued", "downloading", "analyzing"}
 PROGRESS_INTERVAL = 1.0
+PROCESS_TIMEOUT_SECONDS = 240
+WIDGET_TIMEOUT_SECONDS = 10
 
 
 class VideoWorkflow:
@@ -56,7 +58,18 @@ class VideoWorkflow:
         self, chat_id: int, message_id: int, note: str = "",
         *, progress_frame: int | None = None,
     ) -> float | None:
-        """Ошибка Telegram не отменяет сохранение результата или сам анализ."""
+        """Bound Telegram edits and lock waits so UI failures cannot stall processing."""
+        try:
+            async with asyncio.timeout(WIDGET_TIMEOUT_SECONDS):
+                return await self._refresh_widget(chat_id, message_id, note, progress_frame=progress_frame)
+        except TimeoutError:
+            log.warning("Таймаут обновления карточки chat=%s msg=%s", chat_id, message_id)
+            return float(WIDGET_TIMEOUT_SECONDS)
+
+    async def _refresh_widget(
+        self, chat_id: int, message_id: int, note: str = "",
+        *, progress_frame: int | None = None,
+    ) -> float | None:
         key = (chat_id, message_id)
         lock = self._widget_locks.setdefault(key, asyncio.Lock())
         async with lock:
@@ -97,7 +110,7 @@ class VideoWorkflow:
                     if progress_frame is not None:
                         # Back off outside the widget lock; do not delay the result.
                         return float(exc.retry_after)
-                    if attempt < 2:
+                    if attempt < 2 and exc.retry_after < WIDGET_TIMEOUT_SECONDS / 2:
                         await asyncio.sleep(exc.retry_after)
                         continue
                     log.warning("Не удалось обновить карточку: flood control chat=%s msg=%s", *key)
@@ -186,11 +199,31 @@ class VideoWorkflow:
         progress: dict[str, str] = {}
         animation = asyncio.create_task(self._animate_widget(key, progress))
         try:
-            await self._run_processing(*key, progress=progress)
+            async with asyncio.timeout(PROCESS_TIMEOUT_SECONDS):
+                await self._run_processing(*key, progress=progress)
+        except TimeoutError:
+            log.warning("Общий таймаут обработки chat=%s msg=%s", *key)
+            self._fail_stalled_job(key, "Время обработки истекло. Попробуй повторить анализ.")
+        except Exception:
+            log.exception("Необработанная ошибка кружочка chat=%s msg=%s", *key)
+            self._fail_stalled_job(key, "Не удалось завершить обработку.")
         finally:
             animation.cancel()
             await asyncio.gather(animation, return_exceptions=True)
         await self.refresh_widget(*key)
+
+    def _fail_stalled_job(self, key: tuple[int, int], error: str, *, interrupted: bool = False) -> None:
+        job = self.db.get_video_job(*key)
+        if job is None or job.state not in BUSY_STATES:
+            return
+        if self.expired(job):
+            previous = self.db.get_video_result(*key)
+            self.db.finish_video_job(*key, "done" if previous is not None else "failed", attempt_completed=False)
+        else:
+            self.db.finish_video_job(
+                *key, "failed", error=error,
+                attempt_completed=not interrupted and job.state != "queued",
+            )
 
     async def _run_processing(
         self, chat_id: int, message_id: int, *, progress: dict[str, str],
@@ -225,21 +258,21 @@ class VideoWorkflow:
                         self.db.set_video_job_state(*key, "analyzing")
                         await self.refresh_widget(*key)
                         try:
-                            analysis = await asyncio.to_thread(
-                                analyze_video, target, duration_seconds=job.duration,
-                            )
+                            analysis = await analyze_video(target, duration_seconds=job.duration)
                         except ModelOverloadedError:
                             primary = os.getenv("GEMINI_MODEL", "gemini-3.5-flash-lite").strip()
                             if primary != self.fallback_model:
-                                progress["note"] = "Основная модель перегружена. Пробую резервную — возможны ошибки подсчёта."
+                                progress["note"] = "Основная модель недоступна или не ответила вовремя. Пробую резервную…"
                                 await self.refresh_widget(*key, note=progress["note"])
                                 try:
-                                    analysis = await asyncio.to_thread(
-                                        analyze_video, target, duration_seconds=job.duration,
-                                        model_override=self.fallback_model,
+                                    analysis = await analyze_video(
+                                        target, duration_seconds=job.duration, model_override=self.fallback_model,
                                     )
                                 except ModelOverloadedError:
-                                    log.warning("Резервная модель перегружена chat=%s msg=%s", *key)
+                                    log.warning("Резервная модель недоступна или не ответила chat=%s msg=%s", *key)
+                                    error = "Обе модели Gemini временно недоступны или не ответили вовремя."
+                            else:
+                                error = "Модель Gemini временно недоступна или не ответила вовремя."
         except Exception:
             log.exception("Ошибка обработки кружочка chat=%s msg=%s", *key)
             error = "Не удалось обработать видео."
@@ -259,8 +292,9 @@ class VideoWorkflow:
     @staticmethod
     async def _answer(query: CallbackQuery, text: str | None = None, alert: bool = False) -> None:
         try:
-            await query.answer(text, show_alert=alert)
-        except TelegramAPIError:
+            async with asyncio.timeout(WIDGET_TIMEOUT_SECONDS):
+                await query.answer(text, show_alert=alert)
+        except (TelegramAPIError, TimeoutError):
             log.warning("Не удалось подтвердить нажатие кнопки", exc_info=True)
 
     async def on_callback(self, query: CallbackQuery) -> None:
@@ -378,6 +412,14 @@ class VideoWorkflow:
         await self.expire_actions()
 
     async def expire_actions(self) -> None:
+        # An interrupted handler can leave a busy job without an active task.
+        # Recover it even when the process itself has not restarted.
+        for job in self.db.video_jobs_to_recover():
+            key = (job.chat_id, job.message_id)
+            if key not in self._active:
+                self._fail_stalled_job(
+                    key, "Обработка прервалась. Можно повторить анализ.", interrupted=True,
+                )
         jobs = {
             (job.chat_id, job.message_id): job
             for job in self.db.video_widgets_to_refresh() + self.db.expired_video_widgets()

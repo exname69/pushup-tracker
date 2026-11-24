@@ -27,7 +27,7 @@ from tracker_core import (
     help_text, manual_input_error_message, owner_private, penalty_target, process_manual_reply, report_text,
     personal_text, personal_totals, setup_manual_storage, today_text,
 )
-from vision import analyze_video
+from vision import MODEL_TIMEOUT_SECONDS, analyze_video
 from video_workflow import VideoWorkflow
 
 log = logging.getLogger(__name__)
@@ -289,7 +289,8 @@ async def main() -> None:
         return report_text(day, daily_report_rows(db, chat_id, day, tz, daily_target), daily_target, cash_fine)
 
     async with Bot(token=token) as bot:
-        workflow = VideoWorkflow(bot, db, access, tz, semaphore, DEBUG_GEMINI_MODEL)
+        fallback_model = os.getenv("GEMINI_FALLBACK_MODEL", DEBUG_GEMINI_MODEL).strip() or DEBUG_GEMINI_MODEL
+        workflow = VideoWorkflow(bot, db, access, tz, semaphore, fallback_model)
         dp.callback_query.register(workflow.on_callback, F.data.startswith("video:"))
 
         async def publish_yesterday() -> None:
@@ -637,6 +638,7 @@ async def main() -> None:
                 note = message.video_note
                 details = [
                     "🔎 <b>Gemini: диагностика видео</b>",
+                    f"⏱ Таймаут модели: {MODEL_TIMEOUT_SECONDS} с",
                     f"🧠 Модель отладки: <code>{DEBUG_GEMINI_MODEL}</code>",
                     f"🎬 Длительность видео: {note.duration} с",
                     (f"💾 Размер: {note.file_size / (1024 * 1024):.2f} МБ"
@@ -668,9 +670,8 @@ async def main() -> None:
                             phase = "анализ Gemini"
                             analysis_started = time.perf_counter()
                             try:
-                                analysis = await asyncio.to_thread(
-                                    analyze_video, target, duration_seconds=note.duration,
-                                    model_override=DEBUG_GEMINI_MODEL,
+                                analysis = await analyze_video(
+                                    target, duration_seconds=note.duration, model_override=DEBUG_GEMINI_MODEL,
                                 )
                             finally:
                                 analysis_seconds = time.perf_counter() - analysis_started

@@ -2,7 +2,7 @@
 import asyncio
 import unittest
 from datetime import datetime, timedelta, timezone
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, patch
 from zoneinfo import ZoneInfo
 
 from rich_messages import processing_bar, render_video_card
@@ -147,6 +147,56 @@ class ProgressTests(unittest.TestCase):
         )
         self.assertFalse(actions)
         self.assertEqual(content.html, "<p>💪 Отжимания: <strong>12</strong></p>")
+
+    def test_processing_timeout_releases_slot_and_allows_retry(self):
+        async def run():
+            workflow = VideoWorkflow(
+                None, self.db, None, ZoneInfo("UTC"), asyncio.Semaphore(1), "fallback",
+            )
+            async def stuck(*args, **kwargs):
+                async with workflow.semaphore:
+                    self.db.set_video_job_state(*self.key, "analyzing")
+                    await asyncio.Future()
+
+            workflow._run_processing = stuck
+            workflow.refresh_widget = AsyncMock()
+            with patch("video_workflow.PROCESS_TIMEOUT_SECONDS", 0.01):
+                await workflow._process(*self.key)
+            job = self.db.get_video_job(*self.key)
+            self.assertEqual(job.state, "failed")
+            self.assertEqual(job.completed_attempts, 1)
+            self.assertIsNone(job.action_expires_at_utc)
+            self.assertFalse(workflow.semaphore.locked())
+            self.assertIn("video:retry:", self.card()[0].html)
+            workflow.refresh_widget.assert_awaited_once_with(*self.key)
+
+        asyncio.run(run())
+
+    def test_both_models_unavailable_finishes_attempt(self):
+        from vision import ModelOverloadedError
+
+        async def run():
+            bot = AsyncMock()
+            async def download(file_id, destination, timeout):
+                destination.write_bytes(b"video")
+            bot.download.side_effect = download
+            workflow = VideoWorkflow(
+                bot, self.db, None, ZoneInfo("UTC"), asyncio.Semaphore(1), "fallback",
+            )
+            workflow.refresh_widget = AsyncMock()
+            with patch.dict("os.environ", {"GEMINI_MODEL": "primary"}), patch(
+                "video_workflow.analyze_video", new_callable=AsyncMock,
+            ) as analyze:
+                analyze.side_effect = [ModelOverloadedError("primary"), ModelOverloadedError("fallback")]
+                await workflow._process(*self.key)
+                self.assertEqual(analyze.await_count, 2)
+            job = self.db.get_video_job(*self.key)
+            self.assertEqual(job.state, "failed")
+            self.assertEqual(job.completed_attempts, 1)
+            self.assertIn("Обе модели", job.error)
+            self.assertFalse(workflow.semaphore.locked())
+
+        asyncio.run(run())
 
     def test_animation_is_cancelled_before_final_refresh(self):
         async def run():

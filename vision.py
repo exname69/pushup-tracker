@@ -6,6 +6,7 @@ GEMINI_MODEL.
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import math
@@ -17,10 +18,12 @@ from pathlib import Path
 log = logging.getLogger(__name__)
 MAX_VIDEO_BYTES = 20 * 1024 * 1024
 MAX_REPETITIONS = 1000
+MODEL_TIMEOUT_SECONDS = 45
+TRANSIENT_API_CODES = {408, 429, 500, 502, 503, 504}
 
 
 class ModelOverloadedError(Exception):
-    """Gemini returned HTTP 503 (service overloaded)."""
+    """Gemini is temporarily unavailable or exceeded its request deadline."""
 
 
 @dataclass(frozen=True)
@@ -35,7 +38,7 @@ class Analysis:
     api_seconds: float | None = None
 
 
-def analyze_video(
+async def analyze_video(
     path: str | Path,
     target_fps: int = 5,
     *,
@@ -103,26 +106,31 @@ def analyze_video(
 
     try:
         started = time.perf_counter()
-        with genai.Client(api_key=api_key) as client:
-            response = client.models.generate_content(
-                model=model,
-                contents=types.Content(
-                    parts=[
-                        types.Part(
-                            inline_data=types.Blob(
-                                data=video_path.read_bytes(), mime_type="video/mp4"
+        # The transport timeout is in milliseconds. The outer deadline also
+        # bounds SDK retries and the complete async request.
+        video_bytes = await asyncio.to_thread(video_path.read_bytes)
+        async with asyncio.timeout(MODEL_TIMEOUT_SECONDS):
+            async with genai.Client(
+                api_key=api_key,
+                http_options=types.HttpOptions(timeout=(MODEL_TIMEOUT_SECONDS + 5) * 1000),
+            ).aio as client:
+                response = await client.models.generate_content(
+                    model=model,
+                    contents=types.Content(
+                        parts=[
+                            types.Part(
+                                inline_data=types.Blob(data=video_bytes, mime_type="video/mp4"),
+                                video_metadata=types.VideoMetadata(fps=fps),
                             ),
-                            video_metadata=types.VideoMetadata(fps=fps),
-                        ),
-                        types.Part(text=prompt),
-                    ]
-                ),
-                config=types.GenerateContentConfig(
-                    response_mime_type="application/json",
-                    response_schema=response_schema,
-                    temperature=0,
-                ),
-            )
+                            types.Part(text=prompt),
+                        ]
+                    ),
+                    config=types.GenerateContentConfig(
+                        response_mime_type="application/json",
+                        response_schema=response_schema,
+                        temperature=0,
+                    ),
+                )
         api_seconds = time.perf_counter() - started
 
         usage = getattr(response, "usage_metadata", None)
@@ -198,9 +206,12 @@ def analyze_video(
             requested_fps=fps,
             api_seconds=api_seconds,
         )
+    except TimeoutError as exc:
+        log.warning("Gemini: модель %s не ответила за %s с", model, MODEL_TIMEOUT_SECONDS)
+        raise ModelOverloadedError(model) from exc
     except errors.APIError as exc:
-        if exc.code == 503:
-            log.warning("Gemini: модель %s перегружена (HTTP 503)", model)
+        if exc.code in TRANSIENT_API_CODES:
+            log.warning("Gemini: модель %s временно недоступна (HTTP %s)", model, exc.code)
             raise ModelOverloadedError(model) from exc
         log.exception("Gemini API error: model=%s status=%s", model, exc.code)
         return None

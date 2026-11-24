@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import html
+import hashlib
 import logging
 import os
 import re
@@ -138,11 +139,20 @@ class VideoWorkflow:
             return
         note = message.video_note
         self.db.register_chat(message.chat.id, message.chat.title or "Группа")
-        self.db.create_video_job(
+        created = self.db.create_video_job(
             *key, message.from_user.id, message.from_user.full_name,
             note.file_id, note.duration, note.file_size, message.date,
             message_thread_id=message.message_thread_id,
         )
+        if not created:
+            return
+        duplicate = self.db.check_video_fingerprints(
+            *key, {"file_id": note.file_id, "file_unique_id": note.file_unique_id}, self.tz,
+        )
+        if duplicate:
+            await self.refresh_widget(*key)
+            self._widget_locks.pop(key, None)
+            return
         self._active.add(key)
         try:
             await self.refresh_widget(*key)
@@ -201,6 +211,17 @@ class VideoWorkflow:
                     with tempfile.TemporaryDirectory(prefix="pushup-") as tempdir:
                         target = Path(tempdir) / "note.mp4"
                         await self.bot.download(job.file_id, destination=target, timeout=90)
+                        if target.stat().st_size > 0:
+                            def digest() -> str:
+                                with target.open("rb") as video:
+                                    return hashlib.file_digest(video, "sha256").hexdigest()
+
+                            checksum = await asyncio.to_thread(digest)
+                            if self.db.check_video_fingerprints(
+                                *key, {"sha256": checksum}, self.tz,
+                                preserve_existing=self.db.has_video(*key),
+                            ):
+                                return
                         self.db.set_video_job_state(*key, "analyzing")
                         await self.refresh_widget(*key)
                         try:

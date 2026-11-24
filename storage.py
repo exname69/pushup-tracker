@@ -9,6 +9,7 @@ from pathlib import Path
 from zoneinfo import ZoneInfo
 
 VIDEO_ACTION_TTL = timedelta(minutes=15)
+DUPLICATE_TARGET_MULTIPLIER = 5
 
 
 @dataclass(frozen=True)
@@ -89,6 +90,24 @@ class Storage:
             );
             CREATE INDEX IF NOT EXISTS ix_video_jobs_expiry
                 ON video_jobs(actions_closed, action_expires_at_utc);
+            CREATE TABLE IF NOT EXISTS video_fingerprints (
+                chat_id INTEGER NOT NULL,
+                kind TEXT NOT NULL,
+                fingerprint TEXT NOT NULL,
+                original_message_id INTEGER NOT NULL,
+                PRIMARY KEY (chat_id, kind, fingerprint)
+            );
+            CREATE TABLE IF NOT EXISTS duplicate_videos (
+                chat_id INTEGER NOT NULL,
+                message_id INTEGER NOT NULL,
+                user_id INTEGER NOT NULL,
+                original_message_id INTEGER NOT NULL,
+                day TEXT NOT NULL,
+                detected_at_utc TEXT NOT NULL,
+                PRIMARY KEY (chat_id, message_id)
+            );
+            CREATE INDEX IF NOT EXISTS ix_duplicate_videos_day
+                ON duplicate_videos(chat_id, day, user_id);
             CREATE TABLE IF NOT EXISTS reports (
                 chat_id INTEGER NOT NULL,
                 day TEXT NOT NULL,
@@ -142,6 +161,15 @@ class Storage:
                         "WHERE chat_id=? AND message_id=?",
                         (deadline, chat_id, message_id),
                     )
+
+            # Backfill known Telegram file IDs; never retroactively penalize old jobs.
+            self.conn.execute(
+                """INSERT OR IGNORE INTO video_fingerprints
+                   (chat_id, kind, fingerprint, original_message_id)
+                   SELECT chat_id, 'file_id', file_id, message_id
+                   FROM video_jobs WHERE state!='duplicate'
+                   ORDER BY sent_at_utc, message_id"""
+            )
 
     def register_chat(self, chat_id: int, title: str) -> None:
         now = datetime.now(timezone.utc).isoformat()
@@ -225,6 +253,77 @@ class Storage:
                  file_size, sent_at.astimezone(timezone.utc).isoformat(), message_thread_id),
             )
         return cursor.rowcount == 1
+
+    def check_video_fingerprints(
+        self, chat_id: int, message_id: int, fingerprints: dict[str, str], tz: ZoneInfo,
+        *, preserve_existing: bool = False,
+    ) -> bool:
+        """Claim exact identities or atomically reject a duplicate and record its penalty."""
+        job = self.get_video_job(chat_id, message_id)
+        if job is None:
+            raise ValueError("Unknown video job")
+        if job.state == "duplicate":
+            return True
+        items = [(kind, value) for kind, value in fingerprints.items() if value]
+        with self.conn:
+            original = None
+            for kind, value in items:
+                row = self.conn.execute(
+                    """SELECT original_message_id FROM video_fingerprints
+                       WHERE chat_id=? AND kind=? AND fingerprint=?""",
+                    (chat_id, kind, value),
+                ).fetchone()
+                if row is not None and row[0] != message_id:
+                    original = row[0]
+                    break
+            if original is None or preserve_existing:
+                self.conn.executemany(
+                    """INSERT OR IGNORE INTO video_fingerprints
+                       (chat_id, kind, fingerprint, original_message_id) VALUES (?, ?, ?, ?)""",
+                    [(chat_id, kind, value, message_id) for kind, value in items],
+                )
+                return False
+            day = datetime.fromisoformat(job.sent_at_utc).astimezone(tz).date()
+            self.conn.execute(
+                """INSERT INTO members(chat_id, user_id, display_name) VALUES (?, ?, ?)
+                   ON CONFLICT(chat_id, user_id) DO UPDATE SET display_name=excluded.display_name""",
+                (chat_id, job.user_id, job.display_name),
+            )
+            self.conn.execute(
+                """INSERT OR IGNORE INTO duplicate_videos
+                   (chat_id, message_id, user_id, original_message_id, day, detected_at_utc)
+                   VALUES (?, ?, ?, ?, ?, ?)""",
+                (chat_id, message_id, job.user_id, original, day.isoformat(),
+                 datetime.now(timezone.utc).isoformat()),
+            )
+            self.conn.execute(
+                """UPDATE video_fingerprints SET original_message_id=?
+                   WHERE chat_id=? AND original_message_id=?""",
+                (original, chat_id, message_id),
+            )
+            self.conn.executemany(
+                """INSERT OR IGNORE INTO video_fingerprints
+                   (chat_id, kind, fingerprint, original_message_id) VALUES (?, ?, ?, ?)""",
+                [(chat_id, kind, value, original) for kind, value in items],
+            )
+            self.conn.execute(
+                """UPDATE video_jobs SET state='duplicate', actions_closed=1,
+                   action_expires_at_utc=NULL, widget_dirty=1 WHERE chat_id=? AND message_id=?""",
+                (chat_id, message_id),
+            )
+            return True
+
+    def duplicate_penalty_days(self, chat_id: int, day: date) -> list[tuple[int, str, date]]:
+        return [
+            (user_id, name, date.fromisoformat(day_iso))
+            for user_id, name, day_iso in self.conn.execute(
+                """SELECT DISTINCT d.user_id, m.display_name, d.day
+                   FROM duplicate_videos d JOIN members m
+                   ON m.chat_id=d.chat_id AND m.user_id=d.user_id
+                   WHERE d.chat_id=? AND d.day<=?""",
+                (chat_id, day.isoformat()),
+            )
+        ]
 
     def get_video_job(self, chat_id: int, message_id: int) -> VideoJob | None:
         row = self.conn.execute(
@@ -331,7 +430,7 @@ class Storage:
         if type(count) is not int or count < 0:
             raise ValueError("Количество должно быть целым неотрицательным числом")
         job = self.get_video_job(chat_id, message_id)
-        if job is None:
+        if job is None or job.state == "duplicate":
             return False
         with self.conn:
             self.conn.execute(

@@ -8,7 +8,7 @@ from datetime import date, datetime, timedelta, timezone
 from typing import Any
 from zoneinfo import ZoneInfo
 
-from storage import VIDEO_ACTION_TTL
+from storage import DUPLICATE_TARGET_MULTIPLIER, VIDEO_ACTION_TTL
 
 MAX_MANUAL_COUNT = 96
 MANUAL_REVIEW_THRESHOLD = 80
@@ -268,8 +268,8 @@ def penalty_target(daily_target: int) -> int:
 
 def daily_report_rows(
     db: Any, chat_id: int, day: date, tz: ZoneInfo, daily_target: int = 100
-) -> list[tuple[str, int, int, int, int, bool]]:
-    """(имя, повторы, видео, ручные видео, цель, override).
+) -> list[tuple[str, int, int, int, int, bool, bool]]:
+    """(имя, повторы, видео, ручные видео, цель, override, дубликат).
 
     Цель на день зависит только от *завершённых* предыдущих дней начиная с
     первой записи участника. Текущий незавершённый день не порождает штраф.
@@ -304,20 +304,58 @@ def daily_report_rows(
         totals = member["days"].setdefault(override_day, [0, 0, 0, False])
         totals[0] = override_count
         totals[3] = True
+    for user_id, name, duplicate_day in db.duplicate_penalty_days(chat_id, day):
+        member = members.setdefault(user_id, {"name": name, "first": duplicate_day, "days": {}})
+        member["first"] = min(member["first"], duplicate_day)
+        member.setdefault("duplicate_days", set()).add(duplicate_day)
     result = []
     for member in sorted(members.values(), key=lambda m: m["name"].casefold()):
         current_day = member["first"]
         goal = daily_target
+        duplicate_days = member.get("duplicate_days", set())
         while current_day < day:
             done = member["days"].get(current_day, [0])[0]
-            goal = daily_target if done >= goal else penalty_target(daily_target)
+            # A duplicate day is settled by its x5 goal or a cash fine,
+            # not an additional next-day exercise penalty.
+            goal = daily_target if current_day in duplicate_days or done >= goal else penalty_target(daily_target)
             current_day += timedelta(days=1)
+        duplicate = day in duplicate_days
+        if duplicate:
+            goal = daily_target * DUPLICATE_TARGET_MULTIPLIER
         reps, videos, manual, overridden = member["days"].get(day, [0, 0, 0, False])
-        result.append((member["name"], reps, videos, manual, goal, overridden))
+        result.append((member["name"], reps, videos, manual, goal, overridden, duplicate))
     return result
 
 
-def today_text(day: date, rows: list[tuple[str, int, int, int, int, bool]]) -> str:
+def personal_totals(
+    db: Any, chat_id: int, user_id: int, day: date, tz: ZoneInfo,
+) -> tuple[int, int]:
+    """Current calendar week (Monday) and month, including today and overrides."""
+    week_start = day - timedelta(days=day.weekday())
+    month_start = day.replace(day=1)
+    current = min(week_start, month_start)
+    week = month = 0
+    while current <= day:
+        total = db.daily_user_total(chat_id, user_id, current, tz) or 0
+        if current >= week_start:
+            week += total
+        if current >= month_start:
+            month += total
+        current += timedelta(days=1)
+    return week, month
+
+
+def personal_text(week: int, month: int) -> str:
+    week_text = f"{week:,}".replace(",", " ")
+    month_text = f"{month:,}".replace(",", " ")
+    return (
+        "💪 <b>Моя статистика</b>\n\n"
+        f"За неделю: <b>{week_text}</b>\n"
+        f"За месяц: <b>{month_text}</b>"
+    )
+
+
+def today_text(day: date, rows: list[tuple[str, int, int, int, int, bool, bool]]) -> str:
     """Только сегодняшние отжимания: никаких штрафов/оценок/технических меток."""
     lines = [f"🏋️ <b>Отжимания за {day:%d.%m.%Y}</b>", ""]
     if not rows:
@@ -328,14 +366,15 @@ def today_text(day: date, rows: list[tuple[str, int, int, int, int, bool]]) -> s
 
 
 def report_text(
-    day: date, rows: list[tuple[str, int, int, int, int, bool]], target: int = 100
+    day: date, rows: list[tuple[str, int, int, int, int, bool, bool]], target: int = 100,
+    cash_fine: int = 500,
 ) -> str:
     """Итог ЗАКРЫТОГО дня; использовать для /yesterday и cron, не для /stats."""
     lines = [
         f"🏋️ <b>Итоги за {day:%d.%m.%Y}</b>",
         f"🎯 Обычная норма: <b>{target}</b> отжиманий", "",
     ]
-    for name, count, videos, manual, goal, overridden in rows:
+    for name, count, videos, manual, goal, overridden, duplicate in rows:
         status = "✅" if count >= goal else "❌"
         suffix = f" · ✍️ {manual} вручную" if manual else ""
         if overridden:
@@ -343,18 +382,25 @@ def report_text(
         lines.append(
             f"{status} <b>{html.escape(name)}</b> — {count}/{goal} · 🎥 {videos}{suffix}"
         )
-        if goal > target:
-            lines.append(f"   🔥 Штрафная норма этого дня: <b>{goal}</b>")
-        if count < goal:
-            lines.append(
-                f"   🚨 На {day + timedelta(days=1):%d.%m} назначена норма: "
-                f"<b>{penalty_target(target)}</b>"
-            )
+        if duplicate:
+            lines.append(f"   🚫 Дубликат: норма ×5 — <b>{goal}</b>")
+            if count < goal:
+                lines.append(f"   💸 Денежный штраф: <b>{cash_fine} ₽</b>")
+            else:
+                lines.append("   ✅ Норма ×5 выполнена, денежного штрафа нет.")
+        else:
+            if goal > target:
+                lines.append(f"   🔥 Штрафная норма этого дня: <b>{goal}</b>")
+            if count < goal:
+                lines.append(
+                    f"   🚨 На {day + timedelta(days=1):%d.%m} назначена норма: "
+                    f"<b>{penalty_target(target)}</b>"
+                )
     if not rows:
         lines.append("Пока нет зарегистрированных участников с результатами.")
-    if any(manual for _, _, _, manual, _, _ in rows):
+    if any(manual for _, _, _, manual, _, _, _ in rows):
         lines += ["", "✍️ Ручные результаты можно перепроверить по видео."]
-    if any(overridden for _, _, _, _, _, overridden in rows):
+    if any(overridden for _, _, _, _, _, overridden, _ in rows):
         lines += ["", "🛠️ Итоги некоторых участников изменены владельцем."]
     return "\n".join(lines)
 
@@ -366,6 +412,7 @@ def help_text() -> str:
         "/help — список пользовательских команд\n"
         "/stats, /today — отжимания за сегодня\n"
         "/yesterday — подробные итоги вчера\n"
+        "/me — мои отжимания за неделю и месяц\n"
         "/rules — правила челленджа\n"
         "/myid — твой Telegram ID (в личке)\n\n"
         "Отправь видеокружочек с отжиманиями. Под ним появится карточка обработки. "

@@ -67,6 +67,12 @@ def render_video_card(
     if now.tzinfo is None or now.utcoffset() is None:
         raise ValueError("now должен содержать timezone")
 
+    if job.state == "duplicate":
+        return InputRichMessage(html=(
+            "<p>Этот кружок ты уже присылал, ты хотел всех наебать а наебали тебя, "
+            "за такое у тебя х5 норма за сегодня, либо штраф, нехуй наебывать 😘😘😘</p>"
+        )), False
+
     statuses = {
         "queued": "⏳ В очереди",
         "downloading": "📥 Скачиваю видео…",

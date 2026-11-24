@@ -25,7 +25,7 @@ from tracker_core import (
     MANUAL_INPUT_TTL, MAX_MANUAL_COUNT, MANUAL_REVIEW_THRESHOLD,
     MAX_INVALID_MANUAL_ATTEMPTS, MAX_MANUAL_VIDEOS_PER_DAY, daily_report_rows,
     help_text, manual_input_error_message, owner_private, penalty_target, process_manual_reply, report_text,
-    setup_manual_storage, today_text,
+    personal_text, personal_totals, setup_manual_storage, today_text,
 )
 from vision import analyze_video
 from video_workflow import VideoWorkflow
@@ -40,6 +40,7 @@ PUBLIC_COMMANDS = [
     BotCommand(command="stats", description="Отжимания сегодня"),
     BotCommand(command="today", description="Отжимания сегодня"),
     BotCommand(command="yesterday", description="Итоги вчера"),
+    BotCommand(command="me", description="Мои отжимания за неделю и месяц"),
     BotCommand(command="rules", description="Правила"),
     BotCommand(command="myid", description="Мой Telegram ID (личка)"),
 ]
@@ -285,7 +286,7 @@ async def main() -> None:
     scheduler = AsyncIOScheduler(timezone=tz)
 
     def get_report(chat_id: int, day: date) -> str:
-        return report_text(day, daily_report_rows(db, chat_id, day, tz, daily_target), daily_target)
+        return report_text(day, daily_report_rows(db, chat_id, day, tz, daily_target), daily_target, cash_fine)
 
     async with Bot(token=token) as bot:
         workflow = VideoWorkflow(bot, db, access, tz, semaphore, DEBUG_GEMINI_MODEL)
@@ -435,6 +436,18 @@ async def main() -> None:
             day = datetime.now(tz).date()
             rows = daily_report_rows(db, message.chat.id, day, tz, daily_target)
             await message.answer(today_text(day, rows), parse_mode="HTML")
+
+        @dp.message(Command("me"))
+        async def on_me(message: Message) -> None:
+            if not message.from_user or message.from_user.is_bot:
+                return
+            if message.chat.type not in ("group", "supergroup"):
+                await message.answer("Используй /me в группе челленджа.")
+                return
+            week, month = personal_totals(
+                db, message.chat.id, message.from_user.id, datetime.now(tz).date(), tz,
+            )
+            await message.answer(personal_text(week, month), parse_mode="HTML")
 
         @dp.message(Command("yesterday"))
         async def on_yesterday(message: Message) -> None:

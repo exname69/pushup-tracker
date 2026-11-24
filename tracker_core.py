@@ -172,7 +172,9 @@ def process_manual_reply(
                 (chat_id, original_id),
             )
         return ManualReplyResult("expired", video_message_id=original_id)
-    if job is not None and job.state in ('queued', 'downloading', 'analyzing'):
+    if job is not None and (
+        job.state not in ("done", "failed") or not job.attempt_completed
+    ):
         return ManualReplyResult("busy", video_message_id=original_id)
     if invalid_attempts >= MAX_INVALID_MANUAL_ATTEMPTS:
         return ManualReplyResult("locked", attempts_left=0, video_message_id=original_id)

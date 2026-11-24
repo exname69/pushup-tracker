@@ -25,6 +25,7 @@ from vision import MAX_VIDEO_BYTES, ModelOverloadedError, analyze_video
 
 log = logging.getLogger(__name__)
 BUSY_STATES = {"queued", "downloading", "analyzing"}
+PROGRESS_INTERVAL = 5.0
 
 
 class VideoWorkflow:
@@ -48,7 +49,10 @@ class VideoWorkflow:
             and datetime.now(timezone.utc) >= datetime.fromisoformat(job.action_expires_at_utc)
         )
 
-    async def refresh_widget(self, chat_id: int, message_id: int, note: str = "") -> None:
+    async def refresh_widget(
+        self, chat_id: int, message_id: int, note: str = "",
+        *, progress_frame: int | None = None,
+    ) -> float | None:
         """Ошибка Telegram не отменяет сохранение результата или сам анализ."""
         key = (chat_id, message_id)
         lock = self._widget_locks.setdefault(key, asyncio.Lock())
@@ -57,8 +61,15 @@ class VideoWorkflow:
                 job = self.db.get_video_job(*key)
                 if job is None:
                     return
+                # An animation tick must never overwrite a terminal card.
+                if progress_frame is not None and (
+                    job.state not in {"downloading", "analyzing"} or job.widget_message_id is None
+                ):
+                    return
                 result = self.db.get_video_result(*key)
-                content, actions_open = render_video_card(job, result, self.tz, note)
+                content, actions_open = render_video_card(
+                    job, result, self.tz, note, progress_frame=progress_frame or 0,
+                )
                 try:
                     if job.widget_message_id is None:
                         widget = await self.bot(SendRichMessage(
@@ -75,6 +86,9 @@ class VideoWorkflow:
                     self._mark_rendered(job, result, actions_open)
                     return
                 except TelegramRetryAfter as exc:
+                    if progress_frame is not None:
+                        # Back off outside the widget lock; do not delay the result.
+                        return float(exc.retry_after)
                     if attempt < 2:
                         await asyncio.sleep(exc.retry_after)
                         continue
@@ -100,8 +114,9 @@ class VideoWorkflow:
         if current is None:
             return
         # Ручной ответ мог изменить результат, пока Telegram принимал editMessageText.
-        if (current.state, current.error, current.action_expires_at_utc, self.db.get_video_result(*key)) != (
-            job.state, job.error, job.action_expires_at_utc, result,
+        if (current.state, current.error, current.action_expires_at_utc,
+            current.attempt_completed, self.db.get_video_result(*key)) != (
+            job.state, job.error, job.action_expires_at_utc, job.attempt_completed, result,
         ):
             return
         self.db.mark_video_widget_clean(*key)
@@ -128,7 +143,41 @@ class VideoWorkflow:
         finally:
             self._active.discard(key)
 
+    async def _animate_widget(self, key: tuple[int, int], progress: dict[str, str]) -> None:
+        frame = 0
+        delay = PROGRESS_INTERVAL
+        while True:
+            await asyncio.sleep(delay)
+            job = self.db.get_video_job(*key)
+            if job is None or job.state not in BUSY_STATES:
+                return
+            if job.state == "queued":
+                continue
+            frame += 1
+            try:
+                retry_after = await self.refresh_widget(
+                    *key, note=progress.get("note", ""), progress_frame=frame,
+                )
+                delay = max(PROGRESS_INTERVAL, retry_after or 0)
+            except Exception:
+                # UI errors should not interrupt the actual analysis.
+                log.exception("Ошибка анимации карточки chat=%s msg=%s", *key)
+                delay = PROGRESS_INTERVAL
+
     async def _process(self, chat_id: int, message_id: int) -> None:
+        key = (chat_id, message_id)
+        progress: dict[str, str] = {}
+        animation = asyncio.create_task(self._animate_widget(key, progress))
+        try:
+            await self._run_processing(*key, progress=progress)
+        finally:
+            animation.cancel()
+            await asyncio.gather(animation, return_exceptions=True)
+        await self.refresh_widget(*key)
+
+    async def _run_processing(
+        self, chat_id: int, message_id: int, *, progress: dict[str, str],
+    ) -> None:
         key = (chat_id, message_id)
         job = self.db.get_video_job(*key)
         if job is None:
@@ -154,9 +203,8 @@ class VideoWorkflow:
                         except ModelOverloadedError:
                             primary = os.getenv("GEMINI_MODEL", "gemini-3.5-flash-lite").strip()
                             if primary != self.fallback_model:
-                                await self.refresh_widget(
-                                    *key, note="Основная модель перегружена. Пробую резервную — возможны ошибки подсчёта.",
-                                )
+                                progress["note"] = "Основная модель перегружена. Пробую резервную — возможны ошибки подсчёта."
+                                await self.refresh_widget(*key, note=progress["note"])
                                 try:
                                     analysis = await asyncio.to_thread(
                                         analyze_video, target, duration_seconds=job.duration,
@@ -172,7 +220,6 @@ class VideoWorkflow:
             self.db.finish_video_job(*key, "done")
         else:
             self.db.finish_video_job(*key, "failed", error=error)
-        await self.refresh_widget(*key)
 
     @staticmethod
     async def _answer(query: CallbackQuery, text: str | None = None, alert: bool = False) -> None:
@@ -209,6 +256,9 @@ class VideoWorkflow:
             return
         if key in self._active or job.state in BUSY_STATES or not job.action_expires_at_utc:
             await self._answer(query, "Этот кружочек уже обрабатывается. Дождись результата.")
+            return
+        if action == "manual" and not job.attempt_completed:
+            await self._answer(query, "Сначала запусти обработку кружочка и дождись результата.", True)
             return
         self._active.add(key)
         try:
@@ -270,6 +320,7 @@ class VideoWorkflow:
             self.db.finish_video_job(
                 job.chat_id, job.message_id, "failed",
                 error="Обработка прервалась при перезапуске бота. Можно запустить её заново.",
+                attempt_completed=False,
             )
             if self.access.allowed("group", job.chat_id):
                 await self.refresh_widget(job.chat_id, job.message_id)

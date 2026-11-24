@@ -44,12 +44,22 @@ class EditRichMessage(TelegramMethod[Message | bool]):
     )
 
 
+def processing_bar(frame: int, width: int = 10) -> str:
+    """Indeterminate indicator: the model does not expose completion percentages."""
+    span = 3
+    travel = width - span
+    position = frame % (2 * travel)
+    start = min(position, 2 * travel - position)
+    return "▱" * start + "▰" * span + "▱" * (travel - start)
+
+
 def render_video_card(
     job: VideoJob,
     result: tuple[int, bool] | None,
     tz: ZoneInfo,
     note: str = "",
     now: datetime | None = None,
+    *, progress_frame: int = 0,
 ) -> tuple[InputRichMessage, bool]:
     """Вернуть компактную карточку и признак доступности действий."""
     
@@ -83,12 +93,16 @@ def render_video_card(
     actions_open = bool(terminal and deadline is not None and now < deadline)
     expired = bool(terminal and deadline is not None and now >= deadline)
 
-    # Только заголовок, имя и текущий статус — без таблиц и прогресс-баров.
+    # Компактная карточка с индикатором активности, без фиктивных процентов.
     lines = [
         "<h3>💪 Отжимания</h3>",
         f"<p><strong>{html.escape(job.display_name)}</strong></p>",
         f"<p>{status}</p>",
     ]
+
+    if not terminal:
+        bar = "▱" * 10 if job.state == "queued" else processing_bar(progress_frame)
+        lines.append(f"<p>{bar}</p>")
 
     if result is not None:
         count, manual = result
@@ -105,23 +119,19 @@ def render_video_card(
         lines.append(f"<footer>{html.escape(note)}</footer>")
 
     if actions_open:
-        lines.extend(
-            [
-                '<tg-button-row align="left">',
-                (
-                    '<tg-button type="callback_data" style="primary" '
-                    f'data="video:manual:{job.message_id}">'
-                    "✏️ Изменить</tg-button>"
-                ),
-                (
-                    '<tg-button type="callback_data" '
-                    f'data="video:retry:{job.message_id}">'
-                    "🔄 Повторить</tg-button>"
-                ),
-                "</tg-button-row>",
-                f"<footer>Доступно до {deadline.astimezone(tz):%d.%m %H:%M}</footer>",
-            ]
-        )
+        lines.append('<tg-button-row align="left">')
+        if job.attempt_completed:
+            label = "Ввести вручную" if result is None else "Изменить"
+            lines.append(
+                '<tg-button type="callback_data" style="primary" '
+                f'data="video:manual:{job.message_id}">✏️ {label}</tg-button>'
+            )
+        lines.extend([
+            '<tg-button type="callback_data" '
+            f'data="video:retry:{job.message_id}">🔄 Повторить</tg-button>',
+            "</tg-button-row>",
+            f"<footer>Доступно до {deadline.astimezone(tz):%d.%m %H:%M}</footer>",
+        ])
     elif expired:
         lines.append("<footer>🔒 Время изменения результата истекло</footer>")
 

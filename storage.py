@@ -27,12 +27,13 @@ class VideoJob:
     error: str
     message_thread_id: int | None = None
     actions_closed: bool = False
+    attempt_completed: bool = False
 
 
 _VIDEO_JOB_COLUMNS = (
     "chat_id, message_id, user_id, display_name, file_id, duration, file_size, "
     "sent_at_utc, widget_message_id, state, action_expires_at_utc, error, "
-    "message_thread_id, actions_closed"
+    "message_thread_id, actions_closed, attempt_completed"
 )
 
 
@@ -81,6 +82,7 @@ class Storage:
                 message_thread_id INTEGER,
                 actions_closed INTEGER NOT NULL DEFAULT 0,
                 widget_dirty INTEGER NOT NULL DEFAULT 1,
+                attempt_completed INTEGER NOT NULL DEFAULT 0,
                 PRIMARY KEY (chat_id, message_id)
             );
             CREATE INDEX IF NOT EXISTS ix_video_jobs_expiry
@@ -109,6 +111,14 @@ class Storage:
             if "widget_dirty" not in columns:
                 self.conn.execute(
                     "ALTER TABLE video_jobs ADD COLUMN widget_dirty INTEGER NOT NULL DEFAULT 1"
+                )
+            if "attempt_completed" not in columns:
+                self.conn.execute(
+                    "ALTER TABLE video_jobs ADD COLUMN attempt_completed INTEGER NOT NULL DEFAULT 0"
+                )
+                # Preserve the action window of existing completed videos.
+                self.conn.execute(
+                    "UPDATE video_jobs SET attempt_completed=1 WHERE action_expires_at_utc IS NOT NULL"
                 )
 
     def register_chat(self, chat_id: int, title: str) -> None:
@@ -199,7 +209,7 @@ class Storage:
             f"SELECT {_VIDEO_JOB_COLUMNS} FROM video_jobs WHERE chat_id=? AND message_id=?",
             (chat_id, message_id),
         ).fetchone()
-        return VideoJob(*row[:-1], bool(row[-1])) if row else None
+        return VideoJob(*row[:-2], bool(row[-2]), bool(row[-1])) if row else None
 
     def bind_video_widget(self, chat_id: int, message_id: int, widget_message_id: int | None) -> None:
         with self.conn:
@@ -218,7 +228,7 @@ class Storage:
 
     def finish_video_job(
         self, chat_id: int, message_id: int, state: str, error: str = '',
-        now: datetime | None = None,
+        now: datetime | None = None, *, attempt_completed: bool = True,
     ) -> None:
         now = now or datetime.now(timezone.utc)
         if now.tzinfo is None:
@@ -227,14 +237,19 @@ class Storage:
         with self.conn:
             self.conn.execute(
                 """UPDATE video_jobs SET state=?, error=?, widget_dirty=1,
-                       action_expires_at_utc=COALESCE(action_expires_at_utc, ?)
+                       action_expires_at_utc=CASE
+                           WHEN attempt_completed=0 AND ? THEN ?
+                           ELSE COALESCE(action_expires_at_utc, ?) END,
+                       actions_closed=CASE WHEN attempt_completed=0 AND ? THEN 0 ELSE actions_closed END,
+                       attempt_completed=MAX(attempt_completed, ?)
                    WHERE chat_id=? AND message_id=?""",
-                (state, error, deadline, chat_id, message_id),
+                (state, error, attempt_completed, deadline, deadline,
+                 attempt_completed, attempt_completed, chat_id, message_id),
             )
 
     def video_jobs_to_recover(self) -> list[VideoJob]:
         return [
-            VideoJob(*row[:-1], bool(row[-1]))
+            VideoJob(*row[:-2], bool(row[-2]), bool(row[-1]))
             for row in self.conn.execute(
                 f"SELECT {_VIDEO_JOB_COLUMNS} FROM video_jobs "
                 "WHERE state IN ('queued', 'downloading', 'analyzing')"
@@ -243,7 +258,7 @@ class Storage:
 
     def video_widgets_to_refresh(self) -> list[VideoJob]:
         return [
-            VideoJob(*row[:-1], bool(row[-1]))
+            VideoJob(*row[:-2], bool(row[-2]), bool(row[-1]))
             for row in self.conn.execute(
                 f"SELECT {_VIDEO_JOB_COLUMNS} FROM video_jobs WHERE widget_dirty=1"
             )
@@ -261,7 +276,7 @@ class Storage:
         if now.tzinfo is None:
             raise ValueError("now должен содержать timezone")
         return [
-            VideoJob(*row[:-1], bool(row[-1]))
+            VideoJob(*row[:-2], bool(row[-2]), bool(row[-1]))
             for row in self.conn.execute(
                 f"SELECT {_VIDEO_JOB_COLUMNS} FROM video_jobs "
                 "WHERE actions_closed=0 AND widget_message_id IS NOT NULL "

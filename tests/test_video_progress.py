@@ -8,7 +8,7 @@ from zoneinfo import ZoneInfo
 from rich_messages import processing_bar, render_video_card
 from storage import Storage
 from tracker_core import create_pending_manual, process_manual_reply, setup_manual_storage
-from video_workflow import VideoWorkflow
+from video_workflow import PROGRESS_INTERVAL, VideoWorkflow
 
 
 class ProgressTests(unittest.TestCase):
@@ -34,7 +34,18 @@ class ProgressTests(unittest.TestCase):
         self.assertEqual(frames[0], frames[-1])
         for frame in frames:
             self.assertEqual(len(frame), 10)
-            self.assertEqual(frame.count("▰"), 3)
+            self.assertEqual(frame.count("█"), 3)
+            self.assertEqual(frame.count("░"), 7)
+        self.assertEqual(frames[0], "███░░░░░░░")
+        self.assertEqual(frames[7], "░░░░░░░███")
+        self.assertEqual(PROGRESS_INTERVAL, 1.0)
+
+    def test_card_uses_monospace_blocks(self):
+        content, _ = self.card()
+        self.assertIn("<code>░░░░░░░░░░</code>", content.html)
+        self.db.set_video_job_state(*self.key, "analyzing")
+        content, _ = self.card(frame=1)
+        self.assertIn("<code>░███░░░░░░</code>", content.html)
 
     def test_first_failure_stays_retryable_without_deadline(self):
         for state in ("queued", "downloading", "analyzing"):

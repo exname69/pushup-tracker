@@ -50,7 +50,7 @@ def processing_bar(frame: int, width: int = 10) -> str:
     travel = width - span
     position = frame % (2 * travel)
     start = min(position, 2 * travel - position)
-    return "▱" * start + "▰" * span + "▱" * (travel - start)
+    return "░" * start + "█" * span + "░" * (travel - start)
 
 
 def render_video_card(
@@ -105,8 +105,8 @@ def render_video_card(
     ]
 
     if not terminal:
-        bar = "▱" * 10 if job.state == "queued" else processing_bar(progress_frame)
-        lines.append(f"<p>{bar}</p>")
+        bar = "░" * 10 if job.state == "queued" else processing_bar(progress_frame)
+        lines.append(f"<p><code>{bar}</code></p>")
 
     if result is not None:
         count, manual = result

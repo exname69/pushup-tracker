@@ -25,7 +25,7 @@ from vision import MAX_VIDEO_BYTES, ModelOverloadedError, analyze_video
 
 log = logging.getLogger(__name__)
 BUSY_STATES = {"queued", "downloading", "analyzing"}
-PROGRESS_INTERVAL = 5.0
+PROGRESS_INTERVAL = 1.0
 
 
 class VideoWorkflow:

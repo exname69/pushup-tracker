@@ -137,6 +137,14 @@ class Storage:
             );
             CREATE INDEX IF NOT EXISTS ix_daily_overrides_chat_day
                 ON daily_overrides(chat_id, day);
+            CREATE TABLE IF NOT EXISTS forced_video_results (
+                chat_id INTEGER NOT NULL,
+                message_id INTEGER NOT NULL,
+                count INTEGER NOT NULL CHECK(count >= 0),
+                updated_by INTEGER NOT NULL,
+                updated_at_utc TEXT NOT NULL,
+                PRIMARY KEY(chat_id, message_id)
+            );
             CREATE TABLE IF NOT EXISTS penalty_overrides (
                 chat_id INTEGER NOT NULL,
                 user_id INTEGER NOT NULL CHECK(user_id >= 0),
@@ -392,6 +400,9 @@ class Storage:
             return True
         items = [(kind, value) for kind, value in fingerprints.items() if value]
         with self.conn:
+            self.conn.execute("BEGIN IMMEDIATE")
+            if self.is_video_forced(chat_id, message_id):
+                return False
             original = None
             for kind, value in items:
                 row = self.conn.execute(
@@ -469,7 +480,9 @@ class Storage:
         with self.conn:
             self.conn.execute(
                 "UPDATE video_jobs SET state=?, error='', widget_dirty=1 "
-                "WHERE chat_id=? AND message_id=?",
+                "WHERE chat_id=? AND message_id=? AND NOT EXISTS "
+                "(SELECT 1 FROM forced_video_results f WHERE f.chat_id=video_jobs.chat_id "
+                "AND f.message_id=video_jobs.message_id)",
                 (state, chat_id, message_id),
             )
 
@@ -480,7 +493,7 @@ class Storage:
         with self.conn:
             self.conn.execute("BEGIN IMMEDIATE")
             job = self.get_video_job(chat_id, message_id)
-            if job is not None and job.state != "duplicate":
+            if job is not None and job.state != "duplicate" and not self.is_video_forced(chat_id, message_id):
                 self._finish_job(job, state, error, now, attempt_completed)
 
     def _finish_job(
@@ -554,6 +567,61 @@ class Storage:
         ).fetchone()
         return (row[0], bool(row[1])) if row else None
 
+    def is_video_forced(self, chat_id: int, message_id: int) -> bool:
+        return self.conn.execute(
+            "SELECT 1 FROM forced_video_results WHERE chat_id=? AND message_id=?",
+            (chat_id, message_id),
+        ).fetchone() is not None
+
+    def force_video_result(
+        self, chat_id: int, message_id: int, user_id: int, count: int, updated_by: int,
+    ) -> tuple[str, int | None, datetime | None]:
+        """Owner correction of one known video. Never credit a confirmed duplicate."""
+        if type(count) is not int or not 0 <= count <= 100_000:
+            raise ValueError("Количество должно быть целым числом от 0 до 100000")
+        with self.conn:
+            self.conn.execute("BEGIN IMMEDIATE")
+            job = self.get_video_job(chat_id, message_id)
+            if (job is not None and job.state == "duplicate") or self.conn.execute(
+                "SELECT 1 FROM duplicate_videos WHERE chat_id=? AND message_id=?",
+                (chat_id, message_id),
+            ).fetchone():
+                return "duplicate", None, None
+            previous = self.conn.execute(
+                "SELECT user_id,count,sent_at_utc FROM video_counts WHERE chat_id=? AND message_id=?",
+                (chat_id, message_id),
+            ).fetchone()
+            if job is None and previous is None:
+                return "not_found", None, None
+            if (job is not None and job.user_id != user_id) or (previous is not None and previous[0] != user_id):
+                return "wrong_author", None, None
+            sent_at = job.sent_at_utc if job is not None else previous[2]
+            if job is not None:
+                self.conn.execute(
+                    """INSERT INTO members(chat_id,user_id,display_name) VALUES (?,?,?)
+                       ON CONFLICT(chat_id,user_id) DO UPDATE SET display_name=excluded.display_name""",
+                    (chat_id, user_id, job.display_name),
+                )
+            self.conn.execute(
+                """INSERT INTO video_counts(chat_id,message_id,user_id,count,sent_at_utc,is_manual,was_manual)
+                   VALUES (?,?,?,?,?,0,0)
+                   ON CONFLICT(chat_id,message_id) DO UPDATE SET count=excluded.count,is_manual=0""",
+                (chat_id, message_id, user_id, count, sent_at),
+            )
+            self.conn.execute(
+                """INSERT INTO forced_video_results(chat_id,message_id,count,updated_by,updated_at_utc)
+                   VALUES (?,?,?,?,?) ON CONFLICT(chat_id,message_id) DO UPDATE SET
+                   count=excluded.count,updated_by=excluded.updated_by,updated_at_utc=excluded.updated_at_utc""",
+                (chat_id, message_id, count, updated_by, datetime.now(timezone.utc).isoformat()),
+            )
+            self.conn.execute(
+                """UPDATE video_jobs SET state='done',error='',actions_closed=1,widget_dirty=1
+                   WHERE chat_id=? AND message_id=?""", (chat_id, message_id),
+            )
+            self.conn.execute("DELETE FROM pending_manual WHERE chat_id=? AND video_message_id=?",
+                              (chat_id, message_id))
+            return "accepted", previous[1] if previous else None, datetime.fromisoformat(sent_at)
+
     def replace_video_result(
         self, chat_id: int, message_id: int, count: int, is_manual: bool = False,
         *, finish: bool = False, now: datetime | None = None,
@@ -564,7 +632,7 @@ class Storage:
         with self.conn:
             self.conn.execute("BEGIN IMMEDIATE")
             job = self.get_video_job(chat_id, message_id)
-            if job is None or job.state == "duplicate":
+            if job is None or job.state == "duplicate" or self.is_video_forced(chat_id, message_id):
                 return False
             self.conn.execute(
                 "INSERT INTO members(chat_id, user_id, display_name) VALUES (?, ?, ?) "

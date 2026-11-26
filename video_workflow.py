@@ -140,8 +140,8 @@ class VideoWorkflow:
             return
         # Ручной ответ мог изменить результат, пока Telegram принимал editMessageText.
         if (current.state, current.error, current.action_expires_at_utc,
-            current.completed_attempts, self.db.get_video_result(*key)) != (
-            job.state, job.error, job.action_expires_at_utc, job.completed_attempts, result,
+            current.completed_attempts, current.actions_closed, self.db.get_video_result(*key)) != (
+            job.state, job.error, job.action_expires_at_utc, job.completed_attempts, job.actions_closed, result,
         ):
             return
         self.db.mark_video_widget_clean(*key)
@@ -234,7 +234,7 @@ class VideoWorkflow:
     ) -> None:
         key = (chat_id, message_id)
         job = self.db.get_video_job(*key)
-        if job is None:
+        if job is None or self.db.is_video_forced(*key):
             return
         analysis = None
         error = "Не удалось уверенно распознать отжимания."
@@ -243,17 +243,25 @@ class VideoWorkflow:
                 error = "Кружочек превышает лимит скачивания (20 МБ)."
             else:
                 async with self.semaphore:
+                    if self.db.is_video_forced(*key):
+                        return
                     self.db.set_video_job_state(*key, "downloading")
                     await self.refresh_widget(*key)
+                    if self.db.is_video_forced(*key):
+                        return
                     with tempfile.TemporaryDirectory(prefix="pushup-") as tempdir:
                         target = Path(tempdir) / "note.mp4"
                         await self.bot.download(job.file_id, destination=target, timeout=90)
+                        if self.db.is_video_forced(*key):
+                            return
                         if target.stat().st_size > 0:
                             def digest() -> str:
                                 with target.open("rb") as video:
                                     return hashlib.file_digest(video, "sha256").hexdigest()
 
                             checksum = await asyncio.to_thread(digest)
+                            if self.db.is_video_forced(*key):
+                                return
                             if self.db.check_video_fingerprints(
                                 *key, {"sha256": checksum}, self.tz,
                                 preserve_existing=self.db.has_video(*key),
@@ -261,13 +269,19 @@ class VideoWorkflow:
                                 return
                         self.db.set_video_job_state(*key, "analyzing")
                         await self.refresh_widget(*key)
+                        if self.db.is_video_forced(*key):
+                            return
                         try:
                             analysis = await analyze_video(target, duration_seconds=job.duration)
                         except ModelOverloadedError:
+                            if self.db.is_video_forced(*key):
+                                return
                             primary = os.getenv("GEMINI_MODEL", "gemini-3.5-flash-lite").strip()
                             if primary != self.fallback_model:
                                 progress["note"] = "Основная модель недоступна или не ответила вовремя. Пробую резервную…"
                                 await self.refresh_widget(*key, note=progress["note"])
+                                if self.db.is_video_forced(*key):
+                                    return
                                 try:
                                     analysis = await analyze_video(
                                         target, duration_seconds=job.duration, model_override=self.fallback_model,
@@ -280,7 +294,9 @@ class VideoWorkflow:
         except Exception:
             log.exception("Ошибка обработки кружочка chat=%s msg=%s", *key)
             error = "Не удалось обработать видео."
-        # A retry finishing after the fixed deadline must not change the count.
+        # Owner corrections and expired retries must not be overwritten by late responses.
+        if self.db.is_video_forced(*key):
+            return
         if self.expired(job):
             previous = self.db.get_video_result(*key)
             self.db.finish_video_job(

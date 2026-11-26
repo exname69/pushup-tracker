@@ -703,6 +703,50 @@ async def main() -> None:
                 parse_mode="HTML",
             )
 
+        @dp.message(Command("force"))
+        async def on_force(message: Message) -> None:
+            if not message.from_user or message.from_user.id != owner_id:
+                await message.reply("🔒 Команда доступна только владельцу бота.")
+                return
+            original = message.reply_to_message
+            args = (message.text or "").split()[1:]
+            if message.chat.type not in ("group", "supergroup") or not original or not original.video_note or not original.from_user or original.from_user.is_bot:
+                await message.reply("Ответь командой /force 15 на исходный видеокружочек участника в группе.")
+                return
+            if len(args) != 1 or not re.fullmatch(r"[0-9]{1,6}", args[0]) or int(args[0]) > MAX_DAILY_OVERRIDE:
+                await message.reply("❌ Укажи целое число от 0 до 100000: /force 15")
+                return
+            count = int(args[0])
+            key = (message.chat.id, original.message_id)
+            status, previous, sent_at = db.force_video_result(*key, original.from_user.id, count, owner_id)
+            if status != "accepted":
+                errors = {
+                    "duplicate": "❌ Кружочек признан дубликатом. /force не засчитывает подтверждённые дубликаты.",
+                    "not_found": "❌ Кружочек отсутствует в базе бота.",
+                    "wrong_author": "❌ Автор кружочка не совпадает с записью в базе.",
+                }
+                await message.reply(errors[status])
+                return
+            day = sent_at.astimezone(tz).date()
+            override_exists = db.conn.execute(
+                "SELECT 1 FROM daily_overrides WHERE chat_id=? AND user_id=? AND day=?",
+                (key[0], original.from_user.id, day.isoformat()),
+            ).fetchone() is not None
+            log.info("Принудительный результат: chat=%s message=%s user=%s previous=%s count=%s owner=%s",
+                     *key, original.from_user.id, previous, count, owner_id)
+            previous_text = str(previous) if previous is not None else "не засчитано"
+            warning = ("\n⚠️ За этот день установлен итог через /setpushups. "
+                       "Он имеет приоритет; /clearpushups вернёт подсчёт по видео.") if override_exists else ""
+            await message.reply(
+                f"✅ <b>Результат кружочка исправлен</b>\n"
+                f"👤 {html.escape(original.from_user.full_name)}\n"
+                f"📅 {day:%d.%m.%Y}\n"
+                f"💪 {previous_text} → <b>{count}</b>{warning}",
+                parse_mode="HTML",
+            )
+            if db.get_video_job(*key) is not None:
+                await workflow.refresh_widget(*key)
+
         @dp.message(F.text, F.reply_to_message)
         async def on_manual_reply(message: Message) -> None:
             if not message.from_user or message.from_user.is_bot or not message.reply_to_message:

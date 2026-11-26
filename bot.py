@@ -27,11 +27,10 @@ from tracker_core import (
     help_text, manual_input_error_message, owner_private, penalty_target, process_manual_reply, report_text,
     personal_text, personal_totals, setup_manual_storage, today_text,
 )
-from vision import MODEL_TIMEOUT_SECONDS, analyze_video
+from vision import MAX_VIDEO_BYTES, MODEL_TIMEOUT_SECONDS, analyze_video
 from video_workflow import VideoWorkflow
 
 log = logging.getLogger(__name__)
-MAX_DOWNLOAD_BYTES = 20 * 1024 * 1024
 MAX_DAILY_OVERRIDE = 100_000
 DEBUG_GEMINI_MODEL = "gemini-3.5-flash-lite"
 PUBLIC_COMMANDS = [
@@ -57,6 +56,23 @@ def parse_id_list(raw: str, label: str) -> set[int]:
         except ValueError as exc:
             raise ValueError(f"В {label} указан некорректный ID: {item!r}") from exc
     return result
+
+
+def parse_target_history(raw: str) -> dict[date, int]:
+    history = {}
+    for entry in raw.split(","):
+        if not entry.strip():
+            continue
+        try:
+            effective, value = entry.strip().split("=")
+            day = date.fromisoformat(effective.strip())
+            target = int(value)
+            if target <= 0 or day in history:
+                raise ValueError
+        except ValueError as exc:
+            raise ValueError("DAILY_TARGET_HISTORY ожидает уникальные даты и положительные нормы в виде YYYY-MM-DD=30") from exc
+        history[day] = target
+    return history
 
 
 class AccessControl:
@@ -136,6 +152,27 @@ class AccessMiddleware(BaseMiddleware):
         else:
             return None
         return await handler(event, data)
+
+
+async def process_startup_updates(bot: Bot, dp: Dispatcher, allowed: list[str]) -> None:
+    """Finish updates already queued in Telegram before publishing a missed midnight report."""
+    remaining = (await bot.get_webhook_info()).pending_update_count
+    offset = None
+    while remaining > 0:
+        updates = await bot.get_updates(offset=offset, limit=min(remaining, 100), timeout=0, allowed_updates=allowed)
+        if not updates:
+            return
+        for update in updates:
+            try:
+                await dp.feed_update(bot, update)
+            except Exception:
+                # Match normal polling: a failed handler must not block the following updates.
+                log.exception("Ошибка обработки накопленного обновления %s", update.update_id)
+        remaining -= len(updates)
+        offset = updates[-1].update_id + 1
+    if offset is not None:
+        # Confirm the processed batch. Any newer update returned here stays unconfirmed for polling.
+        await bot.get_updates(offset=offset, limit=1, timeout=0, allowed_updates=allowed)
 
 
 def debug_text(
@@ -276,6 +313,9 @@ async def main() -> None:
     db_path = os.getenv("DB_PATH", "./data/pushups.sqlite3")
     db = Storage(db_path)
     setup_manual_storage(db)
+    targets = db.record_daily_target(
+        datetime.now(tz).date(), daily_target, parse_target_history(os.getenv("DAILY_TARGET_HISTORY", "")),
+    )
     access = AccessControl(db, owner_id)
     dp = Dispatcher()
     dp.message.outer_middleware(AccessMiddleware(access))
@@ -286,7 +326,7 @@ async def main() -> None:
     scheduler = AsyncIOScheduler(timezone=tz)
 
     def get_report(chat_id: int, day: date) -> str:
-        return report_text(day, daily_report_rows(db, chat_id, day, tz, daily_target), daily_target, cash_fine)
+        return report_text(day, daily_report_rows(db, chat_id, day, tz, targets), targets.on(day), cash_fine)
 
     async with Bot(token=token) as bot:
         fallback_model = os.getenv("GEMINI_FALLBACK_MODEL", DEBUG_GEMINI_MODEL).strip() or DEBUG_GEMINI_MODEL
@@ -435,7 +475,7 @@ async def main() -> None:
         @dp.message(Command("stats", "today"))
         async def on_today(message: Message) -> None:
             day = datetime.now(tz).date()
-            rows = daily_report_rows(db, message.chat.id, day, tz, daily_target)
+            rows = daily_report_rows(db, message.chat.id, day, tz, targets)
             await message.answer(today_text(day, rows), parse_mode="HTML")
 
         @dp.message(Command("me"))
@@ -643,11 +683,11 @@ async def main() -> None:
                     f"🎬 Длительность видео: {note.duration} с",
                     (f"💾 Размер: {note.file_size / (1024 * 1024):.2f} МБ"
                      if note.file_size is not None else "💾 Размер: неизвестен"),
-                    f"📦 Локальный лимит файла: {MAX_DOWNLOAD_BYTES / (1024 * 1024):.0f} МБ",
+                    f"📦 Локальный лимит файла: {MAX_VIDEO_BYTES / (1024 * 1024):.0f} МБ",
                     "🌐 Таймаут скачивания: 90 с",
                     "🧵 Одновременно анализируется до 2 видео",
                 ]
-                if note.file_size and note.file_size > MAX_DOWNLOAD_BYTES:
+                if note.file_size and note.file_size > MAX_VIDEO_BYTES:
                     details += ["❌ Файл превышает локальный лимит — анализ не выполнялся.",
                                 "🧪 Результат не записан в статистику."]
                     await message.answer("\n".join(details), parse_mode="HTML")
@@ -746,7 +786,8 @@ async def main() -> None:
                           id="clean_manual_pending", max_instances=1, coalesce=True)
         scheduler.add_job(workflow.expire_actions, "interval", seconds=10,
                           id="close_video_actions", max_instances=1, coalesce=True)
-        scheduler.start()
+        allowed_updates = dp.resolve_used_update_types()
+        scheduler.start(paused=True)
         try:
             try:
                 await bot.set_my_commands(PUBLIC_COMMANDS)
@@ -754,8 +795,10 @@ async def main() -> None:
                 log.exception("Не удалось обновить список команд Telegram")
             await bot.delete_webhook(drop_pending_updates=False)
             await workflow.recover()
+            await process_startup_updates(bot, dp, allowed_updates)
             await publish_yesterday()
-            await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
+            scheduler.resume()
+            await dp.start_polling(bot, allowed_updates=allowed_updates)
         finally:
             scheduler.shutdown(wait=False)
             db.close()

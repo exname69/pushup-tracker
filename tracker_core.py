@@ -8,7 +8,7 @@ from datetime import date, datetime, timedelta, timezone
 from typing import Any
 from zoneinfo import ZoneInfo
 
-from storage import DUPLICATE_TARGET_MULTIPLIER, VIDEO_ACTION_TTL
+from storage import DUPLICATE_TARGET_MULTIPLIER, VIDEO_ACTION_TTL, DailyTargets
 
 MAX_MANUAL_COUNT = 96
 MANUAL_REVIEW_THRESHOLD = 80
@@ -59,6 +59,7 @@ def is_manual_expired(expires_at_utc: str | None, now: datetime | None = None) -
 def setup_manual_storage(db: Any) -> None:
     """Безопасная идемпотентная миграция существующей базы без потери результатов."""
     with db.conn:
+        db.conn.execute("BEGIN IMMEDIATE")
         columns = {row[1] for row in db.conn.execute("PRAGMA table_info(video_counts)")}
         if "is_manual" not in columns:
             db.conn.execute(
@@ -242,21 +243,9 @@ def process_manual_reply(
         return ManualReplyResult("daily_limit", video_message_id=original_id)
 
     if job is not None:
-        inserted = db.replace_video_result(chat_id, original_id, count, is_manual=True)
-        if inserted:
-            db.finish_video_job(chat_id, original_id, 'done', now=now, attempt_completed=False)
+        inserted = db.replace_video_result(chat_id, original_id, count, is_manual=True, finish=True, now=now)
     else:
-        inserted = db.save_video(chat_id, original_id, author_id, name, count, video_time)
-    with db.conn:
-        if inserted:
-            db.conn.execute(
-                "UPDATE video_counts SET is_manual=1, was_manual=1 WHERE chat_id=? AND message_id=?",
-                (chat_id, original_id),
-            )
-        db.conn.execute(
-            "DELETE FROM pending_manual WHERE chat_id=? AND video_message_id=?",
-            (chat_id, original_id),
-        )
+        inserted = db.save_video(chat_id, original_id, author_id, name, count, video_time, is_manual=True)
     return ManualReplyResult("accepted" if inserted else "duplicate", count, name,
                              notify_owner=bool(inserted and count >= MANUAL_REVIEW_THRESHOLD),
                              video_message_id=original_id)
@@ -267,13 +256,14 @@ def penalty_target(daily_target: int) -> int:
 
 
 def daily_report_rows(
-    db: Any, chat_id: int, day: date, tz: ZoneInfo, daily_target: int = 100
+    db: Any, chat_id: int, day: date, tz: ZoneInfo, daily_target: int | DailyTargets = 100
 ) -> list[tuple[str, int, int, int, int, bool, bool]]:
     """(имя, повторы, видео, ручные видео, цель, override, дубликат).
 
     Цель на день зависит только от *завершённых* предыдущих дней начиная с
     первой записи участника. Текущий незавершённый день не порождает штраф.
     """
+    targets = daily_target if isinstance(daily_target, DailyTargets) else db.daily_targets(daily_target)
     end_utc = datetime.combine(
         day + timedelta(days=1), datetime.min.time(), tzinfo=tz
     ).astimezone(timezone.utc).isoformat()
@@ -311,17 +301,19 @@ def daily_report_rows(
     result = []
     for member in sorted(members.values(), key=lambda m: m["name"].casefold()):
         current_day = member["first"]
-        goal = daily_target
+        goal = targets.on(current_day)
         duplicate_days = member.get("duplicate_days", set())
         while current_day < day:
             done = member["days"].get(current_day, [0])[0]
             # A duplicate day is settled by its x5 goal or a cash fine,
             # not an additional next-day exercise penalty.
-            goal = daily_target if current_day in duplicate_days or done >= goal else penalty_target(daily_target)
+            missed = current_day not in duplicate_days and done < goal
+            previous_base = targets.on(current_day)
             current_day += timedelta(days=1)
+            goal = penalty_target(previous_base) if missed else targets.on(current_day)
         duplicate = day in duplicate_days
         if duplicate:
-            goal = daily_target * DUPLICATE_TARGET_MULTIPLIER
+            goal = targets.on(day) * DUPLICATE_TARGET_MULTIPLIER
         reps, videos, manual, overridden = member["days"].get(day, [0, 0, 0, False])
         result.append((member["name"], reps, videos, manual, goal, overridden, duplicate))
     return result
@@ -389,7 +381,7 @@ def report_text(
             else:
                 lines.append("   ✅ Норма ×5 выполнена, денежного штрафа нет.")
         else:
-            if goal > target:
+            if goal != target:
                 lines.append(f"   🔥 Штрафная норма этого дня: <b>{goal}</b>")
             if count < goal:
                 lines.append(

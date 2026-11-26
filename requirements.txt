@@ -1,6 +1,4 @@
 aiogram==3.24.0
 APScheduler==3.11.0
 python-dotenv==1.0.1
-numpy==1.26.4
-opencv-contrib-python==4.10.0.84
 google-genai>=1.0,<2.0

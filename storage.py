@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import sqlite3
+from bisect import bisect_right
 from dataclasses import dataclass
 from datetime import date, datetime, time, timedelta, timezone
 from pathlib import Path
@@ -10,6 +11,17 @@ from zoneinfo import ZoneInfo
 
 VIDEO_ACTION_TTL = timedelta(minutes=15)
 DUPLICATE_TARGET_MULTIPLIER = 5
+
+
+@dataclass(frozen=True)
+class DailyTargets:
+    days: tuple[date, ...]
+    values: tuple[int, ...]
+
+    def on(self, day: date) -> int:
+        # Before the first known change, use the earliest known ordinary target.
+        index = max(0, bisect_right(self.days, day) - 1)
+        return self.values[index]
 
 
 @dataclass(frozen=True)
@@ -125,9 +137,14 @@ class Storage:
             );
             CREATE INDEX IF NOT EXISTS ix_daily_overrides_chat_day
                 ON daily_overrides(chat_id, day);
+            CREATE TABLE IF NOT EXISTS daily_targets (
+                effective_day TEXT PRIMARY KEY NOT NULL,
+                target INTEGER NOT NULL CHECK (target > 0)
+            );
             """
         )
         with self.conn:
+            self.conn.execute("BEGIN IMMEDIATE")
             columns = {row[1] for row in self.conn.execute("PRAGMA table_info(video_jobs)")}
             if "widget_dirty" not in columns:
                 self.conn.execute(
@@ -170,6 +187,48 @@ class Storage:
                    FROM video_jobs WHERE state!='duplicate'
                    ORDER BY sent_at_utc, message_id"""
             )
+
+    def daily_targets(self, fallback: int) -> DailyTargets:
+        rows = self.conn.execute(
+            "SELECT effective_day, target FROM daily_targets ORDER BY effective_day"
+        ).fetchall()
+        if not rows:
+            return DailyTargets((date.min,), (fallback,))
+        return DailyTargets(
+            tuple(date.fromisoformat(day) for day, _ in rows),
+            tuple(target for _, target in rows),
+        )
+
+    def record_daily_target(
+        self, today: date, target: int, history: dict[date, int],
+    ) -> DailyTargets:
+        if target <= 0 or any(day > today or value <= 0 for day, value in history.items()):
+            raise ValueError("История норм допускает только положительные нормы и даты до сегодняшней включительно")
+        with self.conn:
+            self.conn.execute("BEGIN IMMEDIATE")
+            self.conn.executemany(
+                "INSERT INTO daily_targets(effective_day, target) VALUES (?, ?) "
+                "ON CONFLICT(effective_day) DO NOTHING",
+                [(day.isoformat(), value) for day, value in history.items()],
+            )
+            # Anchor legacy days even if the setting changes again on the first day of use.
+            if today > date.min:
+                self.conn.execute(
+                    "INSERT INTO daily_targets(effective_day, target) SELECT ?, ? "
+                    "WHERE NOT EXISTS (SELECT 1 FROM daily_targets WHERE effective_day < ?)",
+                    ((today - timedelta(days=1)).isoformat(), history.get(today, target), today.isoformat()),
+                )
+            last = self.conn.execute(
+                "SELECT target FROM daily_targets WHERE effective_day<=? ORDER BY effective_day DESC LIMIT 1",
+                (today.isoformat(),),
+            ).fetchone()
+            if last is None or last[0] != target:
+                self.conn.execute(
+                    "INSERT INTO daily_targets(effective_day, target) VALUES (?, ?) "
+                    "ON CONFLICT(effective_day) DO UPDATE SET target=excluded.target",
+                    (today.isoformat(), target),
+                )
+        return self.daily_targets(target)
 
     def register_chat(self, chat_id: int, title: str) -> None:
         now = datetime.now(timezone.utc).isoformat()
@@ -351,25 +410,30 @@ class Storage:
         self, chat_id: int, message_id: int, state: str, error: str = '',
         now: datetime | None = None, *, attempt_completed: bool = True,
     ) -> None:
+        with self.conn:
+            self.conn.execute("BEGIN IMMEDIATE")
+            job = self.get_video_job(chat_id, message_id)
+            if job is not None and job.state != "duplicate":
+                self._finish_job(job, state, error, now, attempt_completed)
+
+    def _finish_job(
+        self, job: VideoJob, state: str, error: str, now: datetime | None, attempt_completed: bool,
+    ) -> None:
         now = now or datetime.now(timezone.utc)
         if now.tzinfo is None:
             raise ValueError("now должен содержать timezone")
-        job = self.get_video_job(chat_id, message_id)
-        if job is None:
-            return
         attempts = job.completed_attempts + int(attempt_completed)
         deadline = job.action_expires_at_utc
         # A first failure stays retryable indefinitely. The window starts on
         # the first success or second completed attempt, whichever comes first.
         if deadline is None and attempt_completed and (state == "done" or attempts >= 2):
             deadline = (now.astimezone(timezone.utc) + VIDEO_ACTION_TTL).isoformat()
-        with self.conn:
-            self.conn.execute(
-                """UPDATE video_jobs SET state=?, error=?, widget_dirty=1,
-                       action_expires_at_utc=?, attempt_completed=?, completed_attempts=?
-                   WHERE chat_id=? AND message_id=?""",
-                (state, error, deadline, int(attempts > 0), attempts, chat_id, message_id),
-            )
+        self.conn.execute(
+            """UPDATE video_jobs SET state=?, error=?, widget_dirty=1,
+                   action_expires_at_utc=?, attempt_completed=?, completed_attempts=?
+               WHERE chat_id=? AND message_id=?""",
+            (state, error, deadline, int(attempts > 0), attempts, job.chat_id, job.message_id),
+        )
 
     def video_jobs_to_recover(self) -> list[VideoJob]:
         return [
@@ -425,14 +489,16 @@ class Storage:
 
     def replace_video_result(
         self, chat_id: int, message_id: int, count: int, is_manual: bool = False,
+        *, finish: bool = False, now: datetime | None = None,
     ) -> bool:
         """Заменить результат кружочка, сохранив автора, дату и расход ручной квоты."""
         if type(count) is not int or count < 0:
             raise ValueError("Количество должно быть целым неотрицательным числом")
-        job = self.get_video_job(chat_id, message_id)
-        if job is None or job.state == "duplicate":
-            return False
         with self.conn:
+            self.conn.execute("BEGIN IMMEDIATE")
+            job = self.get_video_job(chat_id, message_id)
+            if job is None or job.state == "duplicate":
+                return False
             self.conn.execute(
                 "INSERT INTO members(chat_id, user_id, display_name) VALUES (?, ?, ?) "
                 "ON CONFLICT(chat_id, user_id) DO UPDATE SET display_name = excluded.display_name",
@@ -448,11 +514,16 @@ class Storage:
                 (chat_id, message_id, job.user_id, count, job.sent_at_utc,
                  int(is_manual), int(is_manual)),
             )
+            if finish:
+                self._finish_job(job, "done", "", now, attempt_completed=not is_manual)
+                if is_manual:
+                    self.conn.execute("DELETE FROM pending_manual WHERE chat_id=? AND video_message_id=?",
+                                      (chat_id, message_id))
         return True
 
     def save_video(
         self, chat_id: int, message_id: int, user_id: int,
-        display_name: str, count: int, sent_at: datetime,
+        display_name: str, count: int, sent_at: datetime, *, is_manual: bool = False,
     ) -> bool:
         timestamp = sent_at.astimezone(timezone.utc).isoformat()
         with self.conn:
@@ -466,6 +537,12 @@ class Storage:
                 "VALUES (?, ?, ?, ?, ?)",
                 (chat_id, message_id, user_id, count, timestamp),
             )
+            if is_manual:
+                if cursor.rowcount == 1:
+                    self.conn.execute("UPDATE video_counts SET is_manual=1, was_manual=1 "
+                                      "WHERE chat_id=? AND message_id=?", (chat_id, message_id))
+                self.conn.execute("DELETE FROM pending_manual WHERE chat_id=? AND video_message_id=?",
+                                  (chat_id, message_id))
         return cursor.rowcount == 1
 
     def chat_ids(self) -> list[int]:

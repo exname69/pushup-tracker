@@ -284,8 +284,7 @@ class VideoWorkflow:
             )
             return
         if analysis is not None and not analysis.uncertain:
-            self.db.replace_video_result(*key, analysis.repetitions)
-            self.db.finish_video_job(*key, "done")
+            self.db.replace_video_result(*key, analysis.repetitions, finish=True)
         else:
             self.db.finish_video_job(*key, "failed", error=error)
 

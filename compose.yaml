@@ -7,9 +7,9 @@ services:
       - .env
 
     environment:
-      PYTHONUNBUFFERED: "1"
-      OMP_NUM_THREADS: "2"
-      OPENBLAS_NUM_THREADS: "1"
+      DB_PATH: /app/data/pushups.sqlite3
+      # Нормы этой группы из опубликованных отчётов. Пустое значение в .env задаёт чистую историю.
+      DAILY_TARGET_HISTORY: "${DAILY_TARGET_HISTORY-2026-11-24=30,2026-11-25=40}"
 
     volumes:
       - ./data:/app/data

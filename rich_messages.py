@@ -59,7 +59,7 @@ def render_video_card(
     tz: ZoneInfo,
     note: str = "",
     now: datetime | None = None,
-    *, progress_frame: int = 0,
+    *, progress_frame: int = 0, duplicate_waived: bool = False,
 ) -> tuple[InputRichMessage, bool]:
     """Вернуть компактную карточку и признак доступности действий."""
     
@@ -68,6 +68,8 @@ def render_video_card(
         raise ValueError("now должен содержать timezone")
 
     if job.state == "duplicate":
+        if duplicate_waived:
+            return InputRichMessage(html="<p>🚫 Этот кружок уже был прислан. Не засчитано. Штраф на этот день отключён владельцем.</p>"), False
         return InputRichMessage(html=(
             "<p>Этот кружок ты уже присылал, ты хотел всех наебать а наебали тебя, "
             "за такое у тебя х5 норма за сегодня, либо штраф, нехуй наебывать 😘😘😘</p>"

@@ -137,6 +137,15 @@ class Storage:
             );
             CREATE INDEX IF NOT EXISTS ix_daily_overrides_chat_day
                 ON daily_overrides(chat_id, day);
+            CREATE TABLE IF NOT EXISTS penalty_overrides (
+                chat_id INTEGER NOT NULL,
+                user_id INTEGER NOT NULL CHECK(user_id >= 0),
+                day TEXT NOT NULL,
+                mode TEXT NOT NULL CHECK(mode IN ('on', 'off', 'auto')),
+                updated_by INTEGER NOT NULL,
+                updated_at_utc TEXT NOT NULL,
+                PRIMARY KEY(chat_id, user_id, day)
+            );
             CREATE TABLE IF NOT EXISTS daily_targets (
                 effective_day TEXT PRIMARY KEY NOT NULL,
                 target INTEGER NOT NULL CHECK (target > 0)
@@ -229,6 +238,64 @@ class Storage:
                     (today.isoformat(), target),
                 )
         return self.daily_targets(target)
+
+    def set_historical_target(self, day: date, target: int, today: date, fallback: int) -> None:
+        """Correct an effective date without changing today's configured baseline."""
+        if not 0 < target <= 100_000 or day >= today:
+            raise ValueError("Укажите прошедшую дату и норму от 1 до 100000")
+        with self.conn:
+            self.conn.execute("BEGIN IMMEDIATE")
+            current = self.daily_targets(fallback).on(today)
+            self.conn.execute(
+                """INSERT INTO daily_targets(effective_day, target) VALUES (?, ?)
+                   ON CONFLICT(effective_day) DO NOTHING""",
+                (today.isoformat(), current),
+            )
+            self.conn.execute(
+                """INSERT INTO daily_targets(effective_day, target) VALUES (?, ?)
+                   ON CONFLICT(effective_day) DO UPDATE SET target=excluded.target""",
+                (day.isoformat(), target),
+            )
+
+    def set_penalty_mode(
+        self, chat_id: int, user_id: int, day: date, mode: str, updated_by: int,
+    ) -> None:
+        """user_id=0 means everyone; group actions reset exceptions for that day."""
+        if mode not in ("on", "off", "auto") or user_id < 0:
+            raise ValueError("Некорректный режим штрафов")
+        with self.conn:
+            self.conn.execute("BEGIN IMMEDIATE")
+            if user_id == 0:
+                self.conn.execute("DELETE FROM penalty_overrides WHERE chat_id=? AND day=?",
+                                  (chat_id, day.isoformat()))
+            self.conn.execute(
+                """INSERT INTO penalty_overrides(chat_id,user_id,day,mode,updated_by,updated_at_utc)
+                   VALUES (?,?,?,?,?,?)
+                   ON CONFLICT(chat_id,user_id,day) DO UPDATE SET
+                   mode=excluded.mode, updated_by=excluded.updated_by, updated_at_utc=excluded.updated_at_utc""",
+                (chat_id, user_id, day.isoformat(), mode, updated_by,
+                 datetime.now(timezone.utc).isoformat()),
+            )
+            self.conn.execute(
+                """UPDATE video_jobs SET widget_dirty=1 WHERE chat_id=? AND state='duplicate'
+                   AND message_id IN (SELECT message_id FROM duplicate_videos
+                    WHERE chat_id=? AND day=? AND (?=0 OR user_id=?))""",
+                (chat_id, chat_id, day.isoformat(), user_id, user_id),
+            )
+
+    def penalty_modes_until(self, chat_id: int, day: date) -> dict[tuple[int, date], str]:
+        return {(uid, date.fromisoformat(d)): mode for uid, d, mode in self.conn.execute(
+            "SELECT user_id,day,mode FROM penalty_overrides WHERE chat_id=? AND day<=?",
+            (chat_id, day.isoformat()),
+        )}
+
+    def penalty_mode(self, chat_id: int, user_id: int, day: date) -> str:
+        row = self.conn.execute(
+            """SELECT mode FROM penalty_overrides WHERE chat_id=? AND day=?
+               AND user_id IN (0,?) ORDER BY user_id DESC LIMIT 1""",
+            (chat_id, day.isoformat(), user_id),
+        ).fetchone()
+        return row[0] if row else "auto"
 
     def register_chat(self, chat_id: int, title: str) -> None:
         now = datetime.now(timezone.utc).isoformat()

@@ -25,7 +25,7 @@ from tracker_core import (
     MANUAL_INPUT_TTL, MAX_MANUAL_COUNT, MANUAL_REVIEW_THRESHOLD,
     MAX_INVALID_MANUAL_ATTEMPTS, MAX_MANUAL_VIDEOS_PER_DAY, daily_report_rows,
     help_text, manual_input_error_message, owner_private, penalty_target, process_manual_reply, report_text,
-    personal_text, personal_totals, setup_manual_storage, today_text,
+    daily_report_entries, group_debug_lines, personal_text, personal_totals, setup_manual_storage, today_text,
 )
 from vision import MAX_VIDEO_BYTES, MODEL_TIMEOUT_SECONDS, analyze_video
 from video_workflow import VideoWorkflow
@@ -313,7 +313,7 @@ async def main() -> None:
     db_path = os.getenv("DB_PATH", "./data/pushups.sqlite3")
     db = Storage(db_path)
     setup_manual_storage(db)
-    targets = db.record_daily_target(
+    db.record_daily_target(
         datetime.now(tz).date(), daily_target, parse_target_history(os.getenv("DAILY_TARGET_HISTORY", "")),
     )
     access = AccessControl(db, owner_id)
@@ -326,7 +326,15 @@ async def main() -> None:
     scheduler = AsyncIOScheduler(timezone=tz)
 
     def get_report(chat_id: int, day: date) -> str:
-        return report_text(day, daily_report_rows(db, chat_id, day, tz, targets), targets.on(day), cash_fine)
+        targets = db.daily_targets(daily_target)
+        entries = daily_report_entries(db, chat_id, day, tz, targets)
+        tomorrow = day + timedelta(days=1)
+        next_rows = dict(daily_report_entries(db, chat_id, tomorrow, tz, targets))
+        return report_text(
+            day, [row for _, row in entries], targets.on(day), cash_fine,
+            next_goals=[(next_rows[uid][4], next_rows[uid][6]) for uid, _ in entries],
+            next_base=targets.on(tomorrow),
+        )
 
     async with Bot(token=token) as bot:
         fallback_model = os.getenv("GEMINI_FALLBACK_MODEL", DEBUG_GEMINI_MODEL).strip() or DEBUG_GEMINI_MODEL
@@ -475,7 +483,7 @@ async def main() -> None:
         @dp.message(Command("stats", "today"))
         async def on_today(message: Message) -> None:
             day = datetime.now(tz).date()
-            rows = daily_report_rows(db, message.chat.id, day, tz, targets)
+            rows = daily_report_rows(db, message.chat.id, day, tz, daily_target)
             await message.answer(today_text(day, rows), parse_mode="HTML")
 
         @dp.message(Command("me"))
@@ -497,10 +505,94 @@ async def main() -> None:
 
         @dp.message(Command("debug"))
         async def on_debug(message: Message) -> None:
+            if message.chat.type in ("group", "supergroup"):
+                day = datetime.now(tz).date()
+                lines = group_debug_lines(db, message.chat.id, day, tz, daily_target, cash_fine)
+                chunk = ""
+                for line in lines:
+                    if chunk and len(chunk) + len(line) > 3800:
+                        await message.answer(chunk, parse_mode="HTML")
+                        chunk = ""
+                    chunk += line + "\n"
+                if chunk:
+                    await message.answer(chunk, parse_mode="HTML")
+                return
             if not owner_private(message.chat.type, message.from_user.id if message.from_user else None, owner_id):
                 return
             text = debug_text(db, tz, daily_target, owner_id, access, scheduler, started_at, db_path)
             await message.answer(text, parse_mode="HTML")
+
+        @dp.message(Command("penalty", "settarget"))
+        async def on_penalty_admin(message: Message) -> None:
+            if not message.from_user or message.from_user.id != owner_id:
+                await message.reply("🔒 Команда доступна только владельцу бота.")
+                return
+            if message.chat.type not in ("group", "supergroup"):
+                await message.reply("Используй команду в нужной группе.")
+                return
+            command, *args = (message.text or "").split()
+            command = command.split("@")[0].lstrip("/")
+            today = datetime.now(tz).date()
+            day = today
+            try:
+                if args and re.fullmatch(r"\d{4}-\d{2}-\d{2}", args[-1]):
+                    day = date.fromisoformat(args.pop())
+                if day > today:
+                    raise ValueError("Дата не может быть в будущем")
+                if command == "settarget":
+                    if len(args) != 1 or day == today:
+                        raise ValueError("Укажи норму и прошедшую дату")
+                    target = int(args[0])
+                    db.set_historical_target(day, target, today, daily_target)
+                    log.info("Коррекция исторической нормы: day=%s target=%s owner=%s", day, target, owner_id)
+                    await message.reply(
+                        f"✅ Историческая норма с {day:%d.%m.%Y}: <b>{target}</b>. "
+                        "Действует до следующей даты изменения, текущая норма сохранена. "
+                        "История общая для всех групп. /debug и /yesterday покажут пересчёт.",
+                        parse_mode="HTML",
+                    )
+                    return
+                if not args or args[0] not in ("on", "off", "auto"):
+                    raise ValueError("Укажи on, off или auto")
+                mode = args.pop(0)
+                if len(args) == 1:
+                    uid = 0 if args[0] == "all" else int(args[0])
+                    if uid == 0 and args[0] != "all":
+                        raise ValueError("Для всей группы используй all")
+                elif not args and message.reply_to_message and message.reply_to_message.from_user:
+                    user = message.reply_to_message.from_user
+                    if user.is_bot:
+                        raise ValueError("Ответь на сообщение участника, не бота")
+                    uid = user.id
+                else:
+                    raise ValueError("Укажи all, USER_ID или ответь на сообщение участника")
+                if not 0 <= uid < 2**63:
+                    raise ValueError("Некорректный USER_ID")
+                if uid and db.member_name(message.chat.id, uid) is None:
+                    raise ValueError("Участник пока не зарегистрирован в статистике")
+                db.set_penalty_mode(message.chat.id, uid, day, mode, owner_id)
+            except ValueError as exc:
+                await message.reply(
+                    f"❌ {html.escape(str(exc))}\n\n"
+                    "<code>/penalty off all [YYYY-MM-DD]</code>\n"
+                    "<code>/penalty on USER_ID [YYYY-MM-DD]</code>\n"
+                    "<code>/penalty auto</code> — ответом на сообщение\n"
+                    "<code>/settarget 30 2026-11-24</code> — историческая базовая норма",
+                    parse_mode="HTML",
+                )
+                return
+            name = "Все участники" if uid == 0 else db.member_name(message.chat.id, uid)
+            descriptions = {
+                "off": "Штрафы на этот день отключены, действует базовая норма. Дубликаты не засчитываются.",
+                "on": "Штрафная норма принудительно назначена; дубликаты сохраняют приоритет ×5.",
+                "auto": "Возвращён автоматический расчёт штрафов.",
+            }
+            log.info("Режим штрафов: chat=%s user=%s day=%s mode=%s owner=%s", message.chat.id, uid, day, mode, owner_id)
+            await message.reply(
+                f"✅ <b>{html.escape(name or str(uid))}</b> · {day:%d.%m.%Y}\n"
+                f"{descriptions[mode]}\n/debug — актуальные нормы.",
+                parse_mode="HTML",
+            )
 
         @dp.message(Command("setpushups", "clearpushups"))
         async def on_override_pushups(message: Message) -> None:

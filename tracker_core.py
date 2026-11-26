@@ -255,9 +255,9 @@ def penalty_target(daily_target: int) -> int:
     return daily_target * 2 + PENALTY_EXTRA
 
 
-def daily_report_rows(
+def daily_report_entries(
     db: Any, chat_id: int, day: date, tz: ZoneInfo, daily_target: int | DailyTargets = 100
-) -> list[tuple[str, int, int, int, int, bool, bool]]:
+) -> list[tuple[int, tuple[str, int, int, int, int, bool, bool]]]:
     """(имя, повторы, видео, ручные видео, цель, override, дубликат).
 
     Цель на день зависит только от *завершённых* предыдущих дней начиная с
@@ -298,25 +298,70 @@ def daily_report_rows(
         member = members.setdefault(user_id, {"name": name, "first": duplicate_day, "days": {}})
         member["first"] = min(member["first"], duplicate_day)
         member.setdefault("duplicate_days", set()).add(duplicate_day)
+    modes = db.penalty_modes_until(chat_id, day)
     result = []
-    for member in sorted(members.values(), key=lambda m: m["name"].casefold()):
+    for user_id, member in sorted(members.items(), key=lambda item: (item[1]["name"].casefold(), item[0])):
         current_day = member["first"]
         goal = targets.on(current_day)
         duplicate_days = member.get("duplicate_days", set())
-        while current_day < day:
-            done = member["days"].get(current_day, [0])[0]
-            # A duplicate day is settled by its x5 goal or a cash fine,
-            # not an additional next-day exercise penalty.
-            missed = current_day not in duplicate_days and done < goal
-            previous_base = targets.on(current_day)
+        while current_day <= day:
+            base = targets.on(current_day)
+            mode = modes.get((user_id, current_day), modes.get((0, current_day), "auto"))
+            duplicate = current_day in duplicate_days and mode != "off"
+            if duplicate:
+                goal = base * DUPLICATE_TARGET_MULTIPLIER
+            elif mode == "off":
+                goal = base
+            elif mode == "on":
+                goal = penalty_target(targets.on(current_day - timedelta(days=1))) if current_day > date.min else penalty_target(base)
+            reps, videos, manual, overridden = member["days"].get(current_day, [0, 0, 0, False])
+            if current_day == day:
+                result.append((user_id, (member["name"], reps, videos, manual, goal, overridden, duplicate)))
+                break
+            missed = not duplicate and reps < goal
             current_day += timedelta(days=1)
-            goal = penalty_target(previous_base) if missed else targets.on(current_day)
-        duplicate = day in duplicate_days
-        if duplicate:
-            goal = targets.on(day) * DUPLICATE_TARGET_MULTIPLIER
-        reps, videos, manual, overridden = member["days"].get(day, [0, 0, 0, False])
-        result.append((member["name"], reps, videos, manual, goal, overridden, duplicate))
+            goal = penalty_target(base) if missed else targets.on(current_day)
     return result
+
+
+def daily_report_rows(
+    db: Any, chat_id: int, day: date, tz: ZoneInfo, daily_target: int | DailyTargets = 100
+) -> list[tuple[str, int, int, int, int, bool, bool]]:
+    return [row for _, row in daily_report_entries(db, chat_id, day, tz, daily_target)]
+
+
+def group_debug_lines(db: Any, chat_id: int, day: date, tz: ZoneInfo, fallback: int, cash_fine: int) -> list[str]:
+    targets = db.daily_targets(fallback)
+    base = targets.on(day)
+    group_mode = db.penalty_mode(chat_id, 0, day)
+    modes = {"auto": "авто", "on": "включён", "off": "выключен"}
+    lines = [
+        f"🔎 <b>Диагностика группы — {day:%d.%m.%Y}</b>",
+        f"🌍 Часовой пояс: {html.escape(tz.key)}",
+        f"🎯 Базовая норма: <b>{base}</b>",
+        f"🔥 Штраф за пропуск вчера: <b>{penalty_target(targets.on(day - timedelta(days=1)))}</b>",
+        f"🚫 Дубликат: <b>{base * DUPLICATE_TARGET_MULTIPLIER}</b> или {cash_fine} ₽",
+        f"⚙️ Режим группы: {modes[group_mode]}",
+        "", "📅 <b>История базовых норм (общая для бота)</b>",
+    ]
+    for effective, value in list(zip(targets.days, targets.values))[-12:]:
+        lines.append(f"{effective:%d.%m.%Y} — {value}")
+    lines.extend(["", "🔥 <b>Штрафные нормы на сегодня</b>"])
+    entries = daily_report_entries(db, chat_id, day, tz, targets)
+    penalized = [(uid, row) for uid, row in entries if row[4] != base or row[6] or db.penalty_mode(chat_id, uid, day) == "on"]
+    if not penalized:
+        lines.append("Ни у кого нет штрафной нормы.")
+    for uid, (name, count, _, _, goal, _, duplicate) in penalized:
+        reason = "дубликат ×5" if duplicate else "штрафная"
+        lines.append(f"{html.escape(name)} — <b>{count}/{goal}</b> · {reason}")
+    lines.extend(["", "👥 <b>Все участники</b>"])
+    if not entries:
+        lines.append("Пока нет участников с результатами.")
+    for uid, (name, count, _, _, goal, _, duplicate) in entries:
+        mode = db.penalty_mode(chat_id, uid, day)
+        status = "✅" if count >= goal else "⏳"
+        lines.append(f"{status} {html.escape(name)} — <b>{count}/{goal}</b> · {modes[mode]}")
+    return lines
 
 
 def personal_totals(
@@ -359,14 +404,15 @@ def today_text(day: date, rows: list[tuple[str, int, int, int, int, bool, bool]]
 
 def report_text(
     day: date, rows: list[tuple[str, int, int, int, int, bool, bool]], target: int = 100,
-    cash_fine: int = 500,
+    cash_fine: int = 500, *, next_goals: list[tuple[int, bool]] | None = None,
+    next_base: int | None = None,
 ) -> str:
     """Итог ЗАКРЫТОГО дня; использовать для /yesterday и cron, не для /stats."""
     lines = [
         f"🏋️ <b>Итоги за {day:%d.%m.%Y}</b>",
         f"🎯 Обычная норма: <b>{target}</b> отжиманий", "",
     ]
-    for name, count, videos, manual, goal, overridden, duplicate in rows:
+    for index, (name, count, videos, manual, goal, overridden, duplicate) in enumerate(rows):
         status = "✅" if count >= goal else "❌"
         suffix = f" · ✍️ {manual} вручную" if manual else ""
         if overridden:
@@ -384,10 +430,14 @@ def report_text(
             if goal != target:
                 lines.append(f"   🔥 Штрафная норма этого дня: <b>{goal}</b>")
             if count < goal:
-                lines.append(
-                    f"   🚨 На {day + timedelta(days=1):%d.%m} назначена норма: "
-                    f"<b>{penalty_target(target)}</b>"
-                )
+                tomorrow_goal, tomorrow_duplicate = next_goals[index] if next_goals is not None else (penalty_target(target), False)
+                if next_base is not None and tomorrow_goal == next_base and not tomorrow_duplicate:
+                    lines.append(f"   ℹ️ На {day + timedelta(days=1):%d.%m} обычная норма: <b>{tomorrow_goal}</b>")
+                else:
+                    lines.append(
+                        f"   🚨 На {day + timedelta(days=1):%d.%m} назначена норма: "
+                        f"<b>{tomorrow_goal}</b>"
+                    )
     if not rows:
         lines.append("Пока нет зарегистрированных участников с результатами.")
     if any(manual for _, _, _, manual, _, _, _ in rows):

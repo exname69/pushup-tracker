@@ -88,8 +88,12 @@ class VideoWorkflow:
                     job.action_expires_at_utc
                     and rendered_at >= datetime.fromisoformat(job.action_expires_at_utc)
                 ))
+                duplicate_waived = job.state == "duplicate" and self.db.penalty_mode(
+                    chat_id, job.user_id, datetime.fromisoformat(job.sent_at_utc).astimezone(self.tz).date(),
+                ) == "off"
                 content, actions_open = render_video_card(
                     job, result, self.tz, note, now=rendered_at, progress_frame=progress_frame or 0,
+                    duplicate_waived=duplicate_waived,
                 )
                 try:
                     if job.widget_message_id is None:

@@ -2,7 +2,7 @@
 """Подсчёт отжиманий через Gemini Video API.
 
 Нужен GEMINI_API_KEY. Модель и параметры можно задать через окружение:
-GEMINI_MODEL.
+GEMINI_MODEL. Промпт читается из prompt.txt (GEMINI_PROMPT_PATH).
 """
 from __future__ import annotations
 
@@ -38,6 +38,15 @@ class Analysis:
     api_seconds: float | None = None
 
 
+def load_prompt() -> str:
+    """Read the current UTF-8 prompt; do not silently use a different prompt."""
+    path = Path(os.getenv("GEMINI_PROMPT_PATH") or Path(__file__).with_name("prompt.txt"))
+    prompt = path.read_text(encoding="utf-8").strip()
+    if not prompt:
+        raise ValueError(f"Пустой промпт Gemini: {path}")
+    return prompt
+
+
 async def analyze_video(
     path: str | Path,
     target_fps: int = 5,
@@ -70,26 +79,11 @@ async def analyze_video(
     fps = max(2, min(int(target_fps), 8))
     model = (model_override or os.getenv("GEMINI_MODEL", "gemini-3.5-flash-lite")).strip()
 
-    prompt = (
-        "Count ALL visible push-up-like movements in the video. "
-        "Count every distinct down-up body movement as one repetition, "
-        "including partial, shallow, fast, sloppy push-ups and rhythmic body rocking. "
-        "Accept ANY camera angle, especially frontal views. "
-        "Do NOT require proper technique, full arm extension, visible legs, "
-        "or the entire body to be in frame. "
-        "Track torso, shoulder, and arm movements. "
-        "Do NOT skip small, fast, or nearly identical repetitions. "
-        "Count every observable cycle exactly once, even with minimal movement. "
-        "Ignore unrelated movements and camera shake. "
-        "Never invent invisible repetitions or estimate by rhythm alone. "
-        "Record the completion time of each repetition in seconds. "
-        "Set uncertain=true only if individual movements cannot be distinguished. "
-        "Return ONLY valid JSON: "
-        '{"count": 3, "completed_at_seconds": [2.4, 4.1, 6.3], "uncertain": false}. '
-        "count MUST equal the number of timestamps, sorted chronologically. "
-        'If no repetitions are visible, return '
-        '{"count": 0, "completed_at_seconds": [], "uncertain": false}.'
-    )
+    try:
+        prompt = load_prompt()
+    except (OSError, ValueError):
+        log.exception("Не удалось загрузить промпт Gemini")
+        return None
 
     response_schema = {
         "type": "OBJECT",
